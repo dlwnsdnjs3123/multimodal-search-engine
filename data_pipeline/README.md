@@ -25,6 +25,14 @@ It produces the processed files used by search and recommendation experiments.
   - builds the ranking training dataset with positive and sampled negative rows
 - `build_candidate_training_data.py`
   - builds richer user/item/interaction features for Two-Tower candidate training
+- `build_sim_users.py`
+  - builds the simulated user pool from customer persona ratios
+- `build_simulated_events.py`
+  - builds the offline simulated search/view/cart/purchase log
+- `validate_simulated_events.py`
+  - validates the simulated event log and writes a local JSON summary
+- `build_event_splits.py`
+  - creates time-based train/valid/test event splits from the simulated log
 - `run_data_pipeline.py`
   - runs the full pipeline in the correct order
 
@@ -67,6 +75,15 @@ Common outputs:
 Test mode outputs:
 - `data/processed/item_master_test.csv`
 - `data/processed/customer_purchase_profile_test.csv`
+- `data/processed/user_persona_scores_test.csv`
+- `data/processed/item_persona_scores_test.csv`
+- `data/processed/sim_users_test.csv`
+- `data/processed/simulated_events_test.csv`
+- `data/processed/simulated_events_validation_test.json`
+- `data/processed/train_events_test.csv`
+- `data/processed/valid_events_test.csv`
+- `data/processed/test_events_test.csv`
+- `data/processed/event_split_summary_test.json`
 - `data/processed/item_features_test.csv`
 - `data/processed/train_data_test.csv`
 - `data/processed/candidate_user_features_test.csv.gz`
@@ -78,6 +95,15 @@ Test mode outputs:
 
 Production mode outputs:
 - `data/processed/item_features.csv`
+- `data/processed/user_persona_scores.csv`
+- `data/processed/item_persona_scores.csv`
+- `data/processed/sim_users.csv`
+- `data/processed/simulated_events.csv`
+- `data/processed/simulated_events_validation.json`
+- `data/processed/train_events.csv`
+- `data/processed/valid_events.csv`
+- `data/processed/test_events.csv`
+- `data/processed/event_split_summary.json`
 - `data/processed/train_data_production.csv`
 - `data/processed/candidate_user_features.csv.gz`
 - `data/processed/candidate_item_features.csv.gz`
@@ -95,6 +121,12 @@ python data_pipeline/build_customer_features.py
 python data_pipeline/build_article_features.py
 python data_pipeline/build_item_master.py
 python data_pipeline/build_customer_purchase_profile.py
+python data_pipeline/build_user_persona_scores.py
+python data_pipeline/build_item_persona_scores.py
+python data_pipeline/build_sim_users.py
+python data_pipeline/build_simulated_events.py
+python data_pipeline/validate_simulated_events.py
+python data_pipeline/build_event_splits.py
 python data_pipeline/build_item_features.py
 python data_pipeline/build_ranking_train_data.py
 python data_pipeline/build_candidate_training_data.py
@@ -106,6 +138,8 @@ python data_pipeline/build_candidate_training_data.py
 - Keep raw CSV files local only; do not commit them.
 - `build_item_master.py` creates the item-level canonical table used by persona scoring and simulation.
 - `build_customer_purchase_profile.py` creates the customer-level purchase summary table used to derive persona ratios.
+- `build_sim_users.py` and `build_simulated_events.py` are offline data-generation scripts; they do not send API requests.
+- `build_event_splits.py` performs the required time-based split for the simulated event log.
 - `build_ranking_train_data.py` expects `customer_features.csv` and `articles_feature.csv` to exist first.
 - The ranking dataset is purchase-based and uses sampled negatives rather than impression logs.
 - `build_candidate_training_data.py` creates a positive-interaction dataset with richer aggregate user/item features for candidate retrieval training.
