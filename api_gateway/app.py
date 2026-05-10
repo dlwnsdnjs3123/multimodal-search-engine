@@ -15,6 +15,7 @@ API Gateway — port 8000
 import csv
 import json
 import os
+import re
 import httpx
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -38,9 +39,17 @@ if not IMAGE_ROOT.exists() and LOCAL_IMAGE_ROOT.exists():
     IMAGE_ROOT = LOCAL_IMAGE_ROOT
 
 ARTICLES_PATH = Path("/app/data/processed/articles_feature.csv")
+# item_features_{test,dev,prod}.csv — avg_price 컬럼 포함
+_ITEM_FEATURES_CANDIDATES = [
+    Path("/app/data/processed/item_features_test.csv"),
+    Path("/app/data/processed/item_features_dev.csv"),
+    Path("/app/data/processed/item_features.csv"),
+]
+# H&M 정규화 가격 → KRW 환산 계수 (중앙값 0.025 ≈ 25,000원 기준)
+PRICE_KRW_FACTOR = 1_000_000
 
 feature_store: RedisFeatureStore
-# article_id → {name, category, color, product_type}
+# article_id → {name, category, color, product_type, price}
 article_meta: dict[str, dict] = {}
 
 
@@ -57,7 +66,23 @@ def _load_article_meta() -> dict[str, dict]:
                     "category": row.get("category", ""),
                     "color": row.get("color", ""),
                     "product_type": row.get("product_type_name", ""),
+                    "price": 0,
                 }
+
+    # item_features CSV에서 avg_price 보강
+    for path in _ITEM_FEATURES_CANDIDATES:
+        if path.exists():
+            with path.open(encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    aid = row.get("article_id", "").strip()
+                    if aid in meta:
+                        try:
+                            raw = float(row.get("avg_price", 0) or 0)
+                            meta[aid]["price"] = int(raw * PRICE_KRW_FACTOR)
+                        except (ValueError, TypeError):
+                            pass
+            break  # 첫 번째로 발견된 파일만 사용
+
     return meta
 
 
@@ -119,7 +144,7 @@ async def _call_gemini(prompt: str, json_mode: bool = False) -> str:
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}",
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": generation_config,
@@ -131,21 +156,68 @@ async def _call_gemini(prompt: str, json_mode: bool = False) -> str:
 
 # ── 엔드포인트 ────────────────────────────────────────────────
 
+def _has_korean(text: str) -> bool:
+    return bool(re.search(r"[가-힣]", text))
+
+
+async def _translate_to_english(query: str) -> str:
+    """한국어 패션 검색어를 영어로 번역. 실패 시 원문 반환."""
+    prompt = (
+        f"Translate this Korean fashion search query to English. "
+        f"Return only the translated English text, nothing else.\n\nQuery: {query}"
+    )
+    try:
+        result = await _call_gemini(prompt)
+        return result.strip() if result.strip() else query
+    except Exception:
+        return query
+
+
 @app.post("/api/search")
 async def search(req: SearchRequest):
-    """search-engine으로 검색 요청을 프록시한다."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    """search-engine으로 검색 요청을 프록시한다.
+
+    한국어 텍스트 쿼리는 Gemini로 영어로 번역 후 CLIP에 전달한다.
+    결과에 name/category/color/price enrichment를 적용한다.
+    """
+    translated_query: str | None = None
+    search_payload = req.model_dump()
+
+    if req.query and _has_korean(req.query) and GEMINI_API_KEY:
+        translated_query = await _translate_to_english(req.query)
+        search_payload["query"] = translated_query
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            resp = await client.post(
-                f"{SEARCH_URL}/search",
-                json=req.model_dump(),
-            )
+            resp = await client.post(f"{SEARCH_URL}/search", json=search_payload)
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise HTTPException(status_code=e.response.status_code, detail=str(e))
         except httpx.RequestError as e:
             raise HTTPException(status_code=503, detail=f"search-engine 연결 실패: {e}")
-    return resp.json()
+
+    result = resp.json()
+
+    # 상품명/카테고리/가격 enrichment
+    enriched_results = []
+    for item in result.get("results", []):
+        pid = str(item.get("product_id", ""))
+        meta = article_meta.get(pid, {})
+        enriched_results.append({
+            **item,
+            "name": meta.get("name") or item.get("name") or pid,
+            "category": meta.get("category", item.get("category", "")),
+            "color": meta.get("color", ""),
+            "product_type": meta.get("product_type", ""),
+            "price": meta.get("price", 0),
+        })
+    result["results"] = enriched_results
+
+    if translated_query:
+        result["original_query"] = req.query
+        result["translated_query"] = translated_query
+
+    return result
 
 
 RECOMMEND_CACHE_TTL = 300  # 5분
@@ -207,6 +279,7 @@ async def recommend(
             "category": meta.get("category", ""),
             "color": meta.get("color", ""),
             "product_type": meta.get("product_type", ""),
+            "price": meta.get("price", 0),
         })
     result["recommendations"] = enriched
 
@@ -392,16 +465,14 @@ async def budget_set(
     candidates = rec_resp.json().get("recommendations", [])
 
     # article_meta에서 가격 정보 보강 후 예산 내 필터
+    # article_meta["price"]는 item_features CSV의 avg_price * PRICE_KRW_FACTOR (KRW)
+    DEFAULT_PRICE = 25000  # 데이터 없는 상품의 폴백 (H&M KRW 중앙가)
     affordable = []
     for item in candidates:
         pid = str(item.get("product_id", ""))
         meta = article_meta.get(pid, {})
-        price_raw = item.get("price", 0)
-        try:
-            price_int = int(float(str(price_raw).replace(",", "").replace("원", "")))
-        except (ValueError, TypeError):
-            price_int = 0
-        if 0 < price_int <= budget:
+        price_int = meta.get("price", 0) or DEFAULT_PRICE
+        if price_int <= budget:
             affordable.append({**item, **meta, "price_int": price_int, "article_id": pid})
 
     if len(affordable) < 2:

@@ -5,7 +5,19 @@
 [알려진 한계 — 명세서 통과에 영향 없음]
 ────────────────────────────
 
-1. 학습 데이터 페르소나 불균형 (데이터 파이프라인 한계)
+1. 시뮬레이터 페르소나 불일치 (시뮬레이터 담당)
+   - simulator/main.py는 config.yaml(6개 페르소나)을 로드
+   - 모델 학습/평가는 persona_config_9.yaml(9개 페르소나) 기준
+   - 빠진 3개: repeat_stable, color_focus, category_focus
+     → 이 페르소나 유저들은 실시간 이벤트가 영원히 생성되지 않음
+     → CT 파이프라인 모니터링 시 이 3개 페르소나는 항상 데이터 부재
+     → 페르소나 균형을 맞추려 해도 시뮬레이터가 커버 못 하면 의미 없음
+   - 두 yaml 스키마가 달라서 단순 경로 교체 불가 (search_queries, inter_event_seconds 필드 차이)
+   - 해결하려면: simulator/main.py의 Persona 클래스가 persona_config_9.yaml 스키마도
+                 처리하도록 수정 후 CONFIG_PATH를 persona_config_9.yaml로 변경
+   - 우선순위: 중간 — 시연 자체에는 영향 없으나 장기적으로 데이터 불균형 심화
+
+2. 학습 데이터 페르소나 불균형 (데이터 파이프라인 한계)
    - 이벤트 기준 분포: value 38% / careful 31% / trendsetter 24% / impulse 6%
    - brand_loyal 11건 / repeat_stable 15건 / color_focus 38건 / category_focus 53건 / practical 4건
    - 원인: H&M이 저가 패션 브랜드라 고객 대부분이 value 성향으로 측정됨
@@ -79,6 +91,24 @@ D. 예산 기반 패션 세트 추천 (4순위)
 ────────────────────────────
 [해결 완료]
 ────────────────────────────
+✅ 한국어 검색 정확도 개선 (2026-05-10)
+     - POST /api/search: 한글 감지 시 Gemini 2.5 Flash Lite로 영어 자동 번역 후 CLIP 전달
+     - 응답에 original_query / translated_query 필드 추가
+     - "파란색 청바지" → "blue jeans", "밝은 색 여름 원피스" → "Bright colored summer dress" 정상 동작 확인
+✅ 검색/추천 결과 가격(KRW) enrichment (2026-05-10)
+     - api_gateway 시작 시 item_features_test.csv의 avg_price 로드 (avg_price × 1,000,000 → KRW)
+     - /api/search, /api/recommend 응답에 price 필드 추가
+     - /api/budget-set 예산 필터도 동일 가격 기반으로 동작
+     - 거래 이력 없는 상품은 price=0 (프론트에서 "가격 미상" 처리 권장)
+✅ Gemini API 연동 완료 (2026-05-10)
+     - 모델: gemini-2.5-flash-lite (해당 API 키에서 무료 지원 확인, docker-compose.yml 키 설정 완료)
+     - 기능 B(추천 이유), 기능 C(온보딩 페르소나), 한국어 번역 모두 동일 _call_gemini() 함수 사용
+     - GEMINI_API_KEY 미설정 시 각 기능 자동 스킵, 서비스 전체 영향 없음
+✅ 추가 기능 A/B/C/D api_gateway 전 엔드포인트 구현 및 동작 확인 (2026-05-10)
+     - A: price_weight/popularity_weight 파라미터 전달 확인
+     - B: include_reasons=true → 한국어 reason_text 생성 확인
+     - C: /api/onboarding → 9개 페르소나 % 반환 / /api/onboarding/select → Redis 반영 후 즉시 추천 반영 확인
+     - D: /api/budget-set → 예산 내 세트 구성 확인 (cross-similarity 미구현 시 score 그리디 자동 대체)
 ✅ 이미지 검색 동작 확인 완료 (2026-05-08)
      - image 엔드포인트: search_type=image, HTTP 200, 상품명 enrichment 포함 결과 반환
      - hybrid 엔드포인트: search_type=hybrid, 텍스트+이미지 combined score 정상
