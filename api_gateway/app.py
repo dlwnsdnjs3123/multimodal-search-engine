@@ -223,20 +223,39 @@ async def search(req: SearchRequest):
 RECOMMEND_CACHE_TTL = 300  # 5분
 
 
+def _weight_cache_suffix(weight_params: dict[str, float | None]) -> str:
+    active_weights = {key: value for key, value in weight_params.items() if value is not None}
+    if not active_weights:
+        return ""
+    encoded = json.dumps(active_weights, sort_keys=True, separators=(",", ":"))
+    return f":{encoded}"
+
+
 @app.get("/api/recommend")
 async def recommend(
     user_id: str = Query(...),
     top_n: int = Query(10),
-    price_weight: float = Query(0.0),       # A: 가격 가중치 (0.0~1.0)
-    popularity_weight: float = Query(0.0),  # A: 인기도 가중치 (0.0~1.0)
-    include_reasons: bool = Query(False),   # B: LLM 추천 이유 포함 여부
+    price_weight: float | None = Query(None, ge=0.0, le=5.0),
+    popularity_weight: float | None = Query(None, ge=0.0, le=5.0),
+    diversity_weight: float | None = Query(None, ge=0.0, le=5.0),
+    freshness_weight: float | None = Query(None, ge=0.0, le=5.0),
+    exploration_weight: float | None = Query(None, ge=0.0, le=5.0),
+    include_reasons: bool = Query(False),
 ):
     """Redis 세션 데이터를 붙여 rec-models로 추천 요청을 프록시한다."""
     features = feature_store.get_user_features(user_id)
     click_count = features["click_count"]
+    weight_params = {
+        "price_weight": price_weight,
+        "popularity_weight": popularity_weight,
+        "diversity_weight": diversity_weight,
+        "freshness_weight": freshness_weight,
+        "exploration_weight": exploration_weight,
+    }
 
-    # include_reasons=True이면 LLM 결과가 붙으므로 캐시 우회
-    cache_key = f"cache:recommend:{user_id}:{top_n}:{click_count}:{price_weight}:{popularity_weight}"
+    # 캐시 키: 클릭 수가 바뀌면 자동으로 캐시 무효화.
+    # include_reasons=True이면 LLM 결과가 붙으므로 캐시를 우회한다.
+    cache_key = f"cache:recommend:{user_id}:{top_n}:{click_count}{_weight_cache_suffix(weight_params)}"
     if not include_reasons:
         cached = feature_store.r.get(cache_key)
         if cached:
@@ -248,9 +267,8 @@ async def recommend(
         "recent_clicks": ",".join(features["recent_clicks"]),
         "click_count": click_count,
         "session_interest": json.dumps(features["session_interest"]) if features["session_interest"] else None,
-        "price_weight": price_weight,        # A: rec-models에 그대로 전달
-        "popularity_weight": popularity_weight,
     }
+    params.update({key: value for key, value in weight_params.items() if value is not None})
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -303,7 +321,8 @@ async def recommend(
         except Exception:
             pass  # LLM 실패해도 추천 결과는 정상 반환
 
-    feature_store.r.set(cache_key, json.dumps(result), ex=RECOMMEND_CACHE_TTL)
+    if not include_reasons:
+        feature_store.r.set(cache_key, json.dumps(result), ex=RECOMMEND_CACHE_TTL)
     return result
 
 
