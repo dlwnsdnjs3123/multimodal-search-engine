@@ -128,6 +128,43 @@ class OnboardingRequest(BaseModel):
     budget_range: str | None = None  # "low" | "mid" | "high"
 
 
+QUERY_INTEREST_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "Ladieswear": (
+        "women", "woman", "ladies", "dress", "skirt", "blouse", "jacket", "outer", "coat",
+        "여성", "여자", "원피스", "스커트", "블라우스", "자켓", "재킷", "아우터", "코트",
+    ),
+    "Menswear": (
+        "men", "man", "mens", "shirt", "suit", "jacket", "outer", "coat",
+        "남성", "남자", "셔츠", "정장", "자켓", "재킷", "아우터", "코트",
+    ),
+    "Divided": (
+        "denim", "jeans", "street", "casual", "청바지", "데님", "스트릿", "캐주얼",
+    ),
+    "Sport": (
+        "sport", "sports", "active", "training", "스포츠", "운동", "트레이닝",
+    ),
+    "Kids": (
+        "kids", "baby", "child", "키즈", "아동", "아이", "베이비",
+    ),
+    "Lingeries/Tights": (
+        "lingerie", "tights", "underwear", "속옷", "타이츠", "스타킹",
+    ),
+}
+QUERY_INTEREST_CATEGORIES = tuple(QUERY_INTEREST_KEYWORDS.keys())
+
+
+def _infer_session_interest_from_query_keywords(query_text: str | None) -> dict[str, int]:
+    if not query_text:
+        return {}
+
+    normalized_query = query_text.lower()
+    inferred: dict[str, int] = {}
+    for category, keywords in QUERY_INTEREST_KEYWORDS.items():
+        if any(keyword.lower() in normalized_query for keyword in keywords):
+            inferred[category] = inferred.get(category, 0) + 2
+    return inferred
+
+
 # ── 유틸: LLM 호출 ───────────────────────────────────────────
 
 async def _call_gemini(prompt: str, json_mode: bool = False) -> str:
@@ -152,6 +189,75 @@ async def _call_gemini(prompt: str, json_mode: bool = False) -> str:
         )
         resp.raise_for_status()
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def _coerce_interest_score(value: object) -> int:
+    try:
+        numeric_value = int(round(float(value)))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(numeric_value, 3))
+
+
+def _parse_query_interest_payload(payload: object) -> dict[str, int]:
+    if not isinstance(payload, dict):
+        return {}
+
+    raw_interest = payload.get("interest", payload)
+    if not isinstance(raw_interest, dict):
+        return {}
+
+    normalized_by_key = {str(key).strip().lower(): value for key, value in raw_interest.items()}
+    inferred: dict[str, int] = {}
+    for category in QUERY_INTEREST_CATEGORIES:
+        score = _coerce_interest_score(normalized_by_key.get(category.lower()))
+        if score > 0:
+            inferred[category] = score
+    return inferred
+
+
+async def _infer_session_interest_from_query_llm(query_text: str) -> dict[str, int]:
+    if not GEMINI_API_KEY or not query_text.strip():
+        return {}
+
+    category_list = ", ".join(QUERY_INTEREST_CATEGORIES)
+    prompt = (
+        "Infer lightweight fashion recommendation interests from the search query.\n"
+        "Return only JSON. Use only these category keys: "
+        f"{category_list}.\n"
+        "Each score must be an integer from 0 to 3. Use 0 when unrelated. "
+        "Keep scores conservative because this is a short-lived search signal.\n\n"
+        f"Search query: {query_text}\n\n"
+        "JSON format:\n"
+        '{"interest":{"Ladieswear":0,"Menswear":0,"Divided":0,"Sport":0,"Kids":0,"Lingeries/Tights":0}}'
+    )
+
+    try:
+        llm_text = await _call_gemini(prompt, json_mode=True)
+        return _parse_query_interest_payload(json.loads(llm_text))
+    except Exception:
+        return {}
+
+
+async def _infer_session_interest_from_query(query_text: str | None) -> dict[str, int]:
+    normalized_query = (query_text or "").strip()
+    if not normalized_query:
+        return {}
+
+    cached_interest = feature_store.get_query_interest_cache(normalized_query)
+    if cached_interest is not None:
+        return {
+            category: _coerce_interest_score(score)
+            for category, score in cached_interest.items()
+            if category in QUERY_INTEREST_CATEGORIES and _coerce_interest_score(score) > 0
+        }
+
+    inferred_interest = await _infer_session_interest_from_query_llm(normalized_query)
+    if not inferred_interest:
+        inferred_interest = _infer_session_interest_from_query_keywords(normalized_query)
+
+    feature_store.set_query_interest_cache(normalized_query, inferred_interest)
+    return inferred_interest
 
 
 # ── 엔드포인트 ────────────────────────────────────────────────
@@ -336,10 +442,25 @@ async def events(req: EventRequest):
     if req.event_type in ("click", "view", "cart", "purchase") and effective_id:
         feature_store.push_click(req.user_id, effective_id)
 
+    interest_changed = False
     if req.category:
         interest = feature_store.get_session_interest(req.user_id)
         interest[req.category] = interest.get(req.category, 0) + 1
         feature_store.set_session_interest(req.user_id, interest)
+        interest_changed = True
+
+    inferred_interest = {}
+    if req.event_type == "search":
+        inferred_interest = await _infer_session_interest_from_query(req.query_text)
+    if inferred_interest:
+        interest = feature_store.get_session_interest(req.user_id)
+        for category, score in inferred_interest.items():
+            interest[category] = interest.get(category, 0) + score
+        feature_store.set_session_interest(req.user_id, interest)
+        interest_changed = True
+
+    if interest_changed:
+        feature_store.invalidate_recommendation_cache(req.user_id)
 
     # rec-models 세션 업데이트 (실패해도 이벤트 저장은 성공으로 처리)
     if effective_id:
@@ -450,6 +571,7 @@ async def onboarding_select(req: PersonaSelectRequest):
 
     session_interest = persona_to_interest[req.persona]
     feature_store.set_session_interest(req.user_id, session_interest)
+    feature_store.invalidate_recommendation_cache(req.user_id)
     return {"status": "ok", "persona": req.persona, "session_interest": session_interest}
 
 
