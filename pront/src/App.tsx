@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   BudgetSetBundle,
   OnboardingPersonaScores,
@@ -41,9 +41,9 @@ type PersonaOption = {
 };
 
 const baseResults: Record<SearchMode, SearchResult[]> = {
-  text: [
-    {
-      id: 1,
+    text: [
+      {
+        id: 1,
       title: "Urban Edge Rider Jacket",
       brand: "Mode Atelier",
       price: "89,000원",
@@ -51,10 +51,10 @@ const baseResults: Record<SearchMode, SearchResult[]> = {
       searchType: "텍스트 검색",
       responseTime: "128ms",
       summary: "질감과 아우터 무드를 반영한 텍스트 기반 탐색 결과입니다.",
-      accent: "linear-gradient(135deg, #35244d 0%, #161822 100%)",
-    },
-    {
-      id: 2,
+        accent: "linear-gradient(135deg, #35244d 0%, #161822 100%)",
+      },
+      {
+        id: 2,
       title: "Minimal Zip Blouson",
       brand: "Noir Form",
       price: "42,000원",
@@ -62,10 +62,10 @@ const baseResults: Record<SearchMode, SearchResult[]> = {
       searchType: "텍스트 검색",
       responseTime: "128ms",
       summary: "미니멀한 블랙 계열 취향과 잘 맞는 후보입니다.",
-      accent: "linear-gradient(135deg, #84553a 0%, #1a1d26 100%)",
-    },
-  ],
-  image: [
+        accent: "linear-gradient(135deg, #84553a 0%, #1a1d26 100%)",
+      },
+    ],
+    image: [
     {
       id: 3,
       title: "Silver Trim Moto Crop",
@@ -75,10 +75,10 @@ const baseResults: Record<SearchMode, SearchResult[]> = {
       searchType: "이미지 검색",
       responseTime: "173ms",
       summary: "업로드 이미지의 실루엣과 광택감을 반영한 결과입니다.",
-      accent: "linear-gradient(135deg, #26314c 0%, #11151d 100%)",
-    },
-    {
-      id: 4,
+        accent: "linear-gradient(135deg, #26314c 0%, #11151d 100%)",
+      },
+      {
+        id: 4,
       title: "Gloss Rider Short",
       brand: "Studio Hex",
       price: "58,000원",
@@ -86,10 +86,10 @@ const baseResults: Record<SearchMode, SearchResult[]> = {
       searchType: "이미지 검색",
       responseTime: "173ms",
       summary: "유사한 재질과 길이감을 우선 반영한 후보입니다.",
-      accent: "linear-gradient(135deg, #5b402f 0%, #181720 100%)",
-    },
-  ],
-  multimodal: [
+        accent: "linear-gradient(135deg, #5b402f 0%, #181720 100%)",
+      },
+    ],
+    multimodal: [
     {
       id: 5,
       title: "Chrome Detail Urban Rider",
@@ -99,10 +99,10 @@ const baseResults: Record<SearchMode, SearchResult[]> = {
       searchType: "텍스트 + 이미지",
       responseTime: "214ms",
       summary: "텍스트 설명과 이미지 특징이 함께 반영된 상위 결과입니다.",
-      accent: "linear-gradient(135deg, #42294f 0%, #11131c 100%)",
-    },
-    {
-      id: 6,
+        accent: "linear-gradient(135deg, #42294f 0%, #11131c 100%)",
+      },
+      {
+        id: 6,
       title: "Blackline Cropped Moto",
       brand: "Noir Craft",
       price: "71,000원",
@@ -110,10 +110,10 @@ const baseResults: Record<SearchMode, SearchResult[]> = {
       searchType: "텍스트 + 이미지",
       responseTime: "214ms",
       summary: "질감과 스타일 키워드가 함께 맞아 높은 점수를 받은 결과입니다.",
-      accent: "linear-gradient(135deg, #72412f 0%, #171923 100%)",
-    },
-  ],
-};
+        accent: "linear-gradient(135deg, #72412f 0%, #171923 100%)",
+      },
+    ],
+  };
 
 const suggestions = [
   "미니멀한 블랙 아우터",
@@ -244,11 +244,11 @@ function App() {
 
   const [onboardingDescription, setOnboardingDescription] = useState("");
   const [selectedStyles, setSelectedStyles] = useState<string[]>(["minimal"]);
-  const [budgetRange, setBudgetRange] = useState("mid");
   const [personaScores, setPersonaScores] = useState<OnboardingPersonaScores>({});
   const [isAnalyzingOnboarding, setIsAnalyzingOnboarding] = useState(false);
   const [isSubmittingPersona, setIsSubmittingPersona] = useState(false);
   const [onboardingError, setOnboardingError] = useState<string | null>(null);
+  const isManagingHistoryRef = useRef(false);
 
   const popularityWeight = 100 - recommendationWeight;
   const budgetLabel = `${Number(budget || 0).toLocaleString("ko-KR")}원`;
@@ -312,6 +312,38 @@ function App() {
     recommendationWeight,
     popularityWeight,
   ]);
+
+  useEffect(() => {
+    const handlePopState = (event: PopStateEvent) => {
+      const nextView = event.state?.view;
+
+      if (showOnboarding && nextView !== "onboarding") {
+        isManagingHistoryRef.current = true;
+        setShowOnboarding(false);
+        isManagingHistoryRef.current = false;
+      }
+    };
+
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [showOnboarding]);
+
+  useEffect(() => {
+    if (!isRegistered || isManagingHistoryRef.current) {
+      return;
+    }
+
+    const currentView = window.history.state?.view;
+
+    if (showOnboarding && currentView !== "onboarding") {
+      window.history.pushState({ view: "onboarding" }, "");
+      return;
+    }
+
+    if (!showOnboarding && currentView === "onboarding") {
+      window.history.replaceState({ view: "main" }, "");
+    }
+  }, [isRegistered, showOnboarding]);
 
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -413,7 +445,7 @@ function App() {
         userId: userId.trim(),
         description: onboardingDescription.trim(),
         styleChoices: selectedStyles,
-        budgetRange,
+        budgetRange: null,
       });
 
       setPersonaScores(scores);
@@ -477,9 +509,9 @@ function App() {
 
   const modeLabel =
     searchMode === "multimodal" ? "멀티모달" : searchMode === "image" ? "이미지" : "텍스트";
-  const selectedPersonaLabel =
-    personaOptions.find((persona) => persona.key === selectedOnboardingPersona)?.name ??
-    selectedOnboardingPersona;
+  const selectedPersona =
+    personaOptions.find((persona) => persona.key === selectedOnboardingPersona) ?? null;
+  const selectedPersonaLabel = selectedPersona?.name ?? selectedOnboardingPersona;
 
   if (showOnboarding) {
     return (
@@ -519,14 +551,6 @@ function App() {
             </div>
 
             <div className="recommendation-toolbar">
-              <label className="user-id-field">
-                <span>예산 범위</span>
-                <select value={budgetRange} onChange={(event) => setBudgetRange(event.target.value)}>
-                  <option value="low">Low</option>
-                  <option value="mid">Mid</option>
-                  <option value="high">High</option>
-                </select>
-              </label>
               <button
                 type="button"
                 className="primary-button"
@@ -538,30 +562,23 @@ function App() {
             </div>
           </div>
 
-          <div className="persona-grid">
-            {personaOptions.map((persona) => (
-              <button
-                key={persona.key}
-                type="button"
-                className={
-                  selectedOnboardingPersona === persona.key ? "persona-option active" : "persona-option"
-                }
-                onClick={() => setSelectedOnboardingPersona(persona.key)}
-              >
-                <p className="persona-name">{persona.name}</p>
-                <h2>{persona.title}</h2>
-                <p className="persona-summary">{persona.summary}</p>
-                <strong>{personaScores[persona.key] ?? 0}%</strong>
+          {selectedPersona && Object.keys(personaScores).length > 0 ? (
+            <div className="persona-grid">
+              <article className="persona-option active">
+                <p className="persona-name">{selectedPersona.name}</p>
+                <h2>{selectedPersona.title}</h2>
+                <p className="persona-summary">{selectedPersona.summary}</p>
+                <strong>{personaScores[selectedPersona.key] ?? 0}%</strong>
                 <div className="persona-traits">
-                  {persona.traits.map((trait) => (
+                  {selectedPersona.traits.map((trait) => (
                     <span key={trait} className="badge">
                       {trait}
                     </span>
                   ))}
                 </div>
-              </button>
-            ))}
-          </div>
+              </article>
+            </div>
+          ) : null}
 
           <div className="onboarding-footer">
             <div className="persona-card">

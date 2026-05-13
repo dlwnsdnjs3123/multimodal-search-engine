@@ -104,6 +104,13 @@ def image_path_for_article(article_id: str) -> Path:
     return IMAGE_ROOT / normalized_id[:3] / f"{normalized_id}.jpg"
 
 
+def image_url_for_article(article_id: str) -> str:
+    normalized_id = article_id.strip()
+    if not normalized_id or not normalized_id.isdigit():
+        return ""
+    return f"/api/images/{normalized_id}"
+
+
 # ── 요청/응답 스키마 ──────────────────────────────────────────
 
 class SearchRequest(BaseModel):
@@ -210,6 +217,7 @@ async def search(req: SearchRequest):
             "color": meta.get("color", ""),
             "product_type": meta.get("product_type", ""),
             "price": meta.get("price", 0),
+            "image_url": image_url_for_article(pid),
         })
     result["results"] = enriched_results
 
@@ -280,6 +288,7 @@ async def recommend(
             "color": meta.get("color", ""),
             "product_type": meta.get("product_type", ""),
             "price": meta.get("price", 0),
+            "image_url": image_url_for_article(pid),
         })
     result["recommendations"] = enriched
 
@@ -473,7 +482,13 @@ async def budget_set(
         meta = article_meta.get(pid, {})
         price_int = meta.get("price", 0) or DEFAULT_PRICE
         if price_int <= budget:
-            affordable.append({**item, **meta, "price_int": price_int, "article_id": pid})
+            affordable.append({
+                **item,
+                **meta,
+                "price_int": price_int,
+                "article_id": pid,
+                "image_url": image_url_for_article(pid),
+            })
 
     if len(affordable) < 2:
         raise HTTPException(status_code=400, detail="예산 내 추천 가능한 상품이 부족합니다")
