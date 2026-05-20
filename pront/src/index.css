@@ -564,6 +564,19 @@ button {
   gap: 12px;
 }
 
+.persona-score-row {
+  display: grid;
+  gap: 8px;
+}
+
+.persona-score-row strong {
+  font-size: 1.15rem;
+}
+
+.persona-score-row input[type="range"] {
+  width: 100%;
+}
+
 .persona-option.active {
   border-color: #111111;
   box-shadow: inset 0 0 0 1px #111111;
@@ -584,6 +597,12 @@ button {
 
 .persona-option h2 {
   font-size: 1.8rem;
+}
+
+.persona-adjustment-note {
+  margin: 0;
+  color: #5a5a5a;
+  font-size: 0.95rem;
 }
 
 @media (max-width: 960px) {

@@ -2,13 +2,11 @@ import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "re
 import {
   BudgetSetBundle,
   OnboardingPersonaScores,
-  RecommendationBundle,
   fetchBudgetSets,
   fetchOnboardingPersonaScores,
   fetchPersonalizedSearchResults,
   fetchRecommendations,
   selectOnboardingPersona,
-  sendInteractionEvent,
 } from "./api";
 
 type SearchMode = "text" | "image" | "multimodal";
@@ -41,11 +39,6 @@ type PersonaOption = {
   traits: string[];
 };
 
-const suggestions = [
-  "미니멀한 블랙 아우터",
-  "실버 디테일이 있는 스트리트 룩",
-  "출근용으로 입을 수 있는 자켓",
-];
 
 const personaOptions: PersonaOption[] = [
   {
@@ -115,13 +108,6 @@ const personaOptions: PersonaOption[] = [
 
 const onboardingStyleOptions = ["casual", "minimal", "street", "sporty", "feminine", "classic"];
 
-const emptyBundle: RecommendationBundle = {
-  items: [],
-  totalLatency: "0ms",
-  stages: [],
-  persona: "미분류",
-};
-
 const emptyBudgetSetBundle: BudgetSetBundle = {
   budget: 0,
   setCount: 0,
@@ -161,16 +147,12 @@ function App() {
   const [hasSearched, setHasSearched] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [isSearching, setIsSearching] = useState(false);
-  const [lastSearchedAt, setLastSearchedAt] = useState("방금 전");
+  const [recommendationWeight, setRecommendationWeight] = useState(0.7);
+  const [isRefreshingRecommendations, setIsRefreshingRecommendations] = useState(false);
+  const [recommendationError, setRecommendationError] = useState<string | null>(null);
 
   const [topN, setTopN] = useState(5);
-  const [recommendationWeight, setRecommendationWeight] = useState(70);
   const [budget, setBudget] = useState("200000");
-  const [activeBundle, setActiveBundle] = useState<RecommendationBundle>(emptyBundle);
-  const [recommendationSeed, setRecommendationSeed] = useState(0);
-  const [isRefreshingRecommendations, setIsRefreshingRecommendations] = useState(false);
-  const [isGeneratingReasons, setIsGeneratingReasons] = useState(false);
-  const [recommendationError, setRecommendationError] = useState<string | null>(null);
   const [budgetSets, setBudgetSets] = useState<BudgetSetBundle>(emptyBudgetSetBundle);
   const [isLoadingBudgetSets, setIsLoadingBudgetSets] = useState(false);
   const [budgetSetError, setBudgetSetError] = useState<string | null>(null);
@@ -183,9 +165,6 @@ function App() {
   const [onboardingError, setOnboardingError] = useState<string | null>(null);
   const isManagingHistoryRef = useRef(false);
 
-  const popularityWeight = 100 - recommendationWeight;
-  const personalizationPriorityWeight = recommendationWeight / 50;
-  const popularityPriorityWeight = popularityWeight / 50;
   const budgetLabel = `${Number(budget || 0).toLocaleString("ko-KR")}원`;
 
   const helperMessage = useMemo(() => {
@@ -202,60 +181,6 @@ function App() {
     setPersonaScores({});
     setOnboardingError(null);
   }, [onboardingDescription, selectedStyles]);
-
-  useEffect(() => {
-    if (!isRegistered || showOnboarding) {
-      return;
-    }
-
-    let cancelled = false;
-
-    const loadRecommendations = async () => {
-      setIsRefreshingRecommendations(true);
-      setRecommendationError(null);
-
-      try {
-        const bundle = await fetchRecommendations(userId.trim() || "anonymous", topN, recommendationSeed, {
-          personaHint: selectedOnboardingPersona,
-          personalizationWeight: personalizationPriorityWeight,
-          popularityWeight: popularityPriorityWeight,
-          includeReasons: false,
-        });
-
-        if (!cancelled) {
-          setActiveBundle(bundle);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setRecommendationError(
-            error instanceof Error ? error.message : "추천 결과를 불러오지 못했습니다.",
-          );
-          setActiveBundle(emptyBundle);
-        }
-      } finally {
-        if (!cancelled) {
-          setIsRefreshingRecommendations(false);
-        }
-      }
-    };
-
-    void loadRecommendations();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    isRegistered,
-    showOnboarding,
-    userId,
-    topN,
-    recommendationSeed,
-    selectedOnboardingPersona,
-    recommendationWeight,
-    popularityWeight,
-    personalizationPriorityWeight,
-    popularityPriorityWeight,
-  ]);
 
   useEffect(() => {
     const handlePopState = (event: PopStateEvent) => {
@@ -325,7 +250,7 @@ function App() {
     setIsSearching(true);
     setHasSearched(true);
     setSearchError(null);
-    setSearchResultView("similarity");
+    setSearchResultView("personalized");
 
     try {
       const response = await fetchPersonalizedSearchResults({
@@ -333,7 +258,7 @@ function App() {
         query: trimmedQuery,
         imageBase64: uploadedImage?.base64 ?? null,
         topK: 80,
-        topN: 10,
+        topN,
         mode: nextMode,
         personaHint: selectedOnboardingPersona,
       });
@@ -349,39 +274,43 @@ function App() {
       setPersonalizedLatency(response.personalized.responseTime);
       setSearchResultPersona(response.personalized.persona);
 
-      if (isRegistered && trimmedQuery) {
-        setRecommendationSeed((current) => current + 1);
-      }
     } catch (error) {
       setResults([]);
       setActiveLatency("0ms");
       setPersonalizedResults([]);
       setPersonalizedLatency("0ms");
       setSearchResultPersona("개인화 검색");
-      setSearchResultView("similarity");
+      setSearchResultView("personalized");
       setSearchError(error instanceof Error ? error.message : "검색 결과를 불러오지 못했습니다.");
     } finally {
-      setLastSearchedAt(new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }));
       setIsSearching(false);
     }
   };
 
-  const handleRecommendationClick = (itemId: number) => {
-    void sendInteractionEvent({
-      userId: userId.trim() || "anonymous",
-      itemId,
-      eventType: "click",
-    });
-  };
-
-  const applySuggestion = (value: string) => {
-    setQuery(value);
-  };
 
   const toggleStyleChoice = (style: string) => {
     setSelectedStyles((current) =>
       current.includes(style) ? current.filter((value) => value !== style) : [...current, style],
     );
+  };
+
+  const updatePersonaScore = (personaKey: string, nextValue: number) => {
+    setPersonaScores((current) => {
+      const clampedValue = Math.max(0, Math.min(100, Math.round(nextValue)));
+      const nextScores = {
+        ...current,
+        [personaKey]: clampedValue,
+      };
+      const total = Object.values(nextScores).reduce((sum, value) => sum + value, 0);
+      if (total > 100) {
+        return current;
+      }
+      const topPersona = Object.entries(nextScores).sort((a, b) => b[1] - a[1])[0]?.[0];
+      if (topPersona) {
+        setSelectedOnboardingPersona(topPersona);
+      }
+      return nextScores;
+    });
   };
 
   const handleSignUp = () => {
@@ -422,35 +351,6 @@ function App() {
     }
   };
 
-  const refreshRecommendations = () => {
-    setRecommendationSeed((current) => current + 1);
-  };
-
-  const generateRecommendationReasons = async () => {
-    if (!isRegistered) {
-      return;
-    }
-
-    setIsGeneratingReasons(true);
-    setRecommendationError(null);
-
-    try {
-      const bundle = await fetchRecommendations(userId.trim() || "anonymous", topN, recommendationSeed, {
-        personaHint: selectedOnboardingPersona,
-        personalizationWeight: personalizationPriorityWeight,
-        popularityWeight: popularityPriorityWeight,
-        includeReasons: true,
-      });
-      setActiveBundle(bundle);
-    } catch (error) {
-      setRecommendationError(
-        error instanceof Error ? error.message : "AI 추천 이유를 생성하지 못했습니다. 잠시 후 다시 시도해 주세요.",
-      );
-    } finally {
-      setIsGeneratingReasons(false);
-    }
-  };
-
   const loadBudgetSets = async () => {
     const parsedBudget = Number(budget);
     if (!userId.trim() || !Number.isFinite(parsedBudget) || parsedBudget <= 0) {
@@ -476,6 +376,49 @@ function App() {
     }
   };
 
+  const loadAiRecommendations = async () => {
+    if (!userId.trim()) {
+      setRecommendationError("사용자 정보를 먼저 설정해 주세요.");
+      return;
+    }
+
+    setIsRefreshingRecommendations(true);
+    setRecommendationError(null);
+
+    try {
+      const bundle = await fetchRecommendations(userId.trim(), topN, Date.now(), {
+        personaHint: selectedOnboardingPersona,
+        personalizationWeight: recommendationWeight,
+        includeReasons: true,
+      });
+
+      const mappedResults: SearchResult[] = bundle.items.map((item) => ({
+        id: item.id,
+        title: item.title,
+        brand: item.brand,
+        price: item.price,
+        similarity: item.score,
+        searchType: "AI 추천",
+        responseTime: bundle.totalLatency,
+        summary: item.reason,
+        accent: item.accent,
+        imageUrl: item.imageUrl,
+      }));
+
+      setPersonalizedResults(mappedResults);
+      setPersonalizedLatency(bundle.totalLatency);
+      setSearchResultPersona(bundle.persona);
+      setSearchResultView("personalized");
+      setHasSearched(true);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "AI 추천 결과를 불러오지 못했습니다.";
+      setRecommendationError(message);
+    } finally {
+      setIsRefreshingRecommendations(false);
+    }
+  };
+
   const startWithPersona = async () => {
     setIsSubmittingPersona(true);
     setOnboardingError(null);
@@ -488,7 +431,6 @@ function App() {
       });
       setShowOnboarding(false);
       setBudgetSets(emptyBudgetSetBundle);
-      setRecommendationSeed((current) => current + 1);
     } catch {
       setOnboardingError("선택한 페르소나를 저장하지 못했습니다.");
     } finally {
@@ -498,15 +440,18 @@ function App() {
 
   const modeLabel =
     searchMode === "multimodal" ? "멀티모달" : searchMode === "image" ? "이미지" : "텍스트";
-  const selectedPersona =
-    personaOptions.find((persona) => persona.key === selectedOnboardingPersona) ?? null;
-  const selectedPersonaLabel = selectedPersona?.name ?? selectedOnboardingPersona;
   const rankedPersonas = personaOptions
     .filter((persona) => (personaScores[persona.key] ?? 0) > 0)
     .sort((left, right) => (personaScores[right.key] ?? 0) - (personaScores[left.key] ?? 0));
+  const personaScoreTotal = Object.values(personaScores).reduce((sum, value) => sum + value, 0);
+  const isPersonaScoreTotalValid = personaScoreTotal === 100;
+  const hasPersonalizedSearchResults = hasSearched && personalizedResults.length > 0;
   const activeSearchResults = searchResultView === "personalized" ? personalizedResults : results;
   const activeSearchLatency = searchResultView === "personalized" ? personalizedLatency : activeLatency;
   const activeSearchScoreLabel = searchResultView === "personalized" ? "추천 점수" : "유사도";
+  const mergedSearchResults = hasPersonalizedSearchResults ? personalizedResults : activeSearchResults;
+  const mergedSearchLatency = hasPersonalizedSearchResults ? personalizedLatency : activeSearchLatency;
+  const mergedSearchScoreLabel = hasPersonalizedSearchResults ? "추천 점수" : activeSearchScoreLabel;
   const searchEmptyMessage = !hasSearched
     ? "검색을 실행하면 유사도순 결과와 내 취향순 결과가 여기에 표시됩니다."
     : searchError
@@ -576,7 +521,17 @@ function App() {
                   <p className="persona-name">{persona.name}</p>
                   <h2>{persona.title}</h2>
                   <p className="persona-summary">{persona.summary}</p>
-                  <strong>{personaScores[persona.key] ?? 0}%</strong>
+                  <div className="persona-score-row">
+                    <strong>{personaScores[persona.key] ?? 0}%</strong>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={personaScores[persona.key] ?? 0}
+                      onChange={(event) => updatePersonaScore(persona.key, Number(event.target.value))}
+                      aria-label={`${persona.name} 비율 조절`}
+                    />
+                  </div>
                   <div className="persona-traits">
                     {persona.traits.map((trait) => (
                       <span key={trait} className="badge">
@@ -591,18 +546,26 @@ function App() {
 
           <div className="onboarding-footer">
             <div className="persona-card">
-              <span>현재 선택된 페르소나</span>
-              <strong>{selectedPersonaLabel}</strong>
+              <span>?? ??</span>
+              <strong>{personaScoreTotal}%</strong>
             </div>
             <button
               type="button"
               className="primary-button"
               onClick={startWithPersona}
-              disabled={isSubmittingPersona || Object.keys(personaScores).length === 0}
+              disabled={
+                isSubmittingPersona || Object.keys(personaScores).length === 0 || !isPersonaScoreTotalValid
+              }
             >
-              {isSubmittingPersona ? "저장 중..." : "이 취향으로 추천 받기"}
+              {isSubmittingPersona ? "?? ?..." : "? ???? ?? ??"}
             </button>
           </div>
+          {rankedPersonas.length > 0 ? (
+            <p className="persona-adjustment-note">
+              ????? ?? ?????. ????? ??? ?? ??? ???.
+              {!isPersonaScoreTotalValid ? " ??? 100%? ??? ?? ??? ??? ? ????." : ""}
+            </p>
+          ) : null}
           {onboardingError ? <p className="status-text">{onboardingError}</p> : null}
         </section>
       </div>
@@ -613,21 +576,8 @@ function App() {
     <div className="app-shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">ModeMosaic</p>
-          <h1>Multimodal Search</h1>
-        </div>
-        <div className="topbar-meta">
-          <span>검색 모드: {modeLabel}</span>
-          <span>최근 검색: {lastSearchedAt}</span>
-          <span>사용자 ID: {userId}</span>
-          <span>개인화 상태: {isRegistered ? "설정 완료" : "설정 전"}</span>
-          <span>선택한 취향: {selectedPersonaLabel}</span>
-          <span>현재 추천 성향: {activeBundle.persona}</span>
-          <span>추천 개수: Top {topN}</span>
-          <span>
-            개인화 {recommendationWeight} / 대중성 {popularityWeight}
-          </span>
-          <span>예산: {budgetLabel}</span>
+          <p className="eyebrow">Fit-Find</p>
+          <h1>Fit-Find: 취향 기반 멀티모달·멀티스테이지 패션 검색 및 추천</h1>
         </div>
       </header>
 
@@ -672,21 +622,58 @@ function App() {
               결과 카드에는 유사도와 응답 시간을 함께 보여줍니다.
             </p>
 
-            <div className="suggestion-row">
-              {suggestions.map((item) => (
-                <button
-                  key={item}
-                  type="button"
-                  className="suggestion-chip"
-                  onClick={() => applySuggestion(item)}
-                >
-                  {item}
-                </button>
-              ))}
+            <div className="panel weight-panel">
+              <div className="weight-copy">
+                <p className="eyebrow">Result Balance</p>
+                <h4>개인화와 유사도 비중 조절</h4>
+                <p>
+                  개인화 {Math.round(recommendationWeight * 100)}% · 유사도{" "}
+                  {100 - Math.round(recommendationWeight * 100)}%
+                </p>
+              </div>
+              <div className="weight-control">
+                <div className="weight-labels">
+                  <span>유사도 중심</span>
+                  <span>개인화 중심</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="5"
+                  value={Math.round(recommendationWeight * 100)}
+                  onChange={(event) => setRecommendationWeight(Number(event.target.value) / 100)}
+                  aria-label="개인화 유사도 가중치"
+                />
+              </div>
             </div>
+
+            <div className="search-actions">
+              <button type="submit" form="search-composer-form" className="primary-button" disabled={isSearching}>
+                {isSearching ? "검색 중..." : "검색 실행"}
+              </button>
+              <button
+                type="button"
+                className="primary-button"
+                onClick={loadAiRecommendations}
+                disabled={isRefreshingRecommendations || !isRegistered}
+              >
+                {isRefreshingRecommendations ? "AI 추천 불러오는 중..." : "AI 추천"}
+              </button>
+              <button
+                type="button"
+                className="primary-button"
+                onClick={loadAiRecommendations}
+                disabled={isRefreshingRecommendations || !isRegistered}
+              >
+                {isRefreshingRecommendations ? "결과 새로고침 중..." : "결과 새로고침"}
+              </button>
+            </div>
+            <p className="search-hint">텍스트만, 이미지만 또는 둘을 함께 검색할 수 있습니다.</p>
+            {recommendationError ? <p className="status-text">{recommendationError}</p> : null}
           </div>
 
-          <form className="search-composer" onSubmit={handleSubmit}>
+          <form id="search-composer-form" className="search-composer" onSubmit={handleSubmit}>
             <div className="search-tabs" aria-label="검색 모드">
               <button
                 type="button"
@@ -754,10 +741,7 @@ function App() {
             </div>
 
             <div className="search-actions">
-              <button type="submit" className="primary-button" disabled={isSearching}>
-                {isSearching ? "검색 중..." : "검색 실행"}
-              </button>
-              <span className="search-hint">텍스트만, 이미지만, 또는 둘 다 함께 검색할 수 있습니다.</span>
+              <span className="search-hint">????, ???? ?? ?? ?? ??? ? ????.</span>
             </div>
           </form>
         </section>
@@ -765,39 +749,41 @@ function App() {
         <section className="panel">
           <div className="section-heading">
             <div>
-              <p className="eyebrow">Search Results</p>
-              <h3>검색 결과</h3>
+              <p className="eyebrow">
+                {hasSearched ? "Personalized Search Results" : "Search Results"}
+              </p>
+              <h3>{hasSearched ? "검색과 추천을 함께 반영한 결과" : "검색 결과"}</h3>
             </div>
             <div className="heading-metrics">
-              <span className="metric">응답 시간 {activeSearchLatency}</span>
-              <span className="metric">결과 수 {activeSearchResults.length}</span>
+              <span className="metric">응답 시간 {mergedSearchLatency}</span>
+              <span className="metric">결과 수 {mergedSearchResults.length}</span>
             </div>
           </div>
 
-          <div className="search-tabs result-tabs" aria-label="검색 결과 정렬 방식">
-            <button
-              type="button"
-              className={searchResultView === "similarity" ? "active" : ""}
-              onClick={() => setSearchResultView("similarity")}
-            >
-              유사도순
-            </button>
-            <button
-              type="button"
-              className={searchResultView === "personalized" ? "active" : ""}
-              onClick={() => setSearchResultView("personalized")}
-            >
-              내 취향순
-            </button>
+          <div className="recommendation-toolbar">
+            <div className="recommendation-actions">
+              <div className="topn-group" role="group" aria-label="Top N 검색 결과 개수">
+                {[3, 5, 10].map((count) => (
+                  <button
+                    key={count}
+                    type="button"
+                    className={topN === count ? "mini-button active" : "mini-button"}
+                    onClick={() => setTopN(count)}
+                  >
+                    Top {count}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
 
-          {activeSearchResults.length === 0 ? (
+          {mergedSearchResults.length === 0 ? (
             <div className="empty-state">
               <p>{searchEmptyMessage}</p>
             </div>
           ) : (
             <div className="result-list">
-              {activeSearchResults.map((item) => (
+              {mergedSearchResults.map((item) => (
                 <article key={item.id} className="result-card">
                   <ResultVisual imageUrl={item.imageUrl} title={item.title} accent={item.accent} />
                   <div className="result-meta">
@@ -809,11 +795,11 @@ function App() {
                     <p>{item.summary}</p>
                     <div className="result-stats">
                       <span className="badge">
-                        {activeSearchScoreLabel} {(item.similarity * 100).toFixed(1)}%
+                        {mergedSearchScoreLabel} {(item.similarity * 100).toFixed(1)}%
                       </span>
                       <span className="badge">{item.searchType}</span>
                       <span className="badge">응답 {item.responseTime}</span>
-                      {searchResultView === "personalized" ? (
+                      {hasPersonalizedSearchResults ? (
                         <span className="badge">{searchResultPersona}</span>
                       ) : null}
                     </div>
@@ -827,14 +813,12 @@ function App() {
         <section className="panel">
           <div className="section-heading">
             <div>
-              <p className="eyebrow">Personalized Recommendations</p>
-              <h3>
-                {userId} 사용자에게 맞춘 추천 결과
-              </h3>
+              <p className="eyebrow">Budget Set</p>
+              <h3>예산 안에서 구성한 추천 세트</h3>
             </div>
             <div className="heading-metrics">
-              <span className="metric">Top-N {topN}</span>
-              <span className="metric">총 추천 시간 {activeBundle.totalLatency}</span>
+              <span className="metric">예산 {budgetLabel}</span>
+              <span className="metric">세트 수 {budgetSets.setCount}</span>
             </div>
           </div>
 
@@ -846,18 +830,10 @@ function App() {
                   value={userId}
                   onChange={(event) => setUserId(event.target.value)}
                   placeholder="예: user_1024"
-                  aria-label="추천 대상 사용자 ID"
+                  aria-label="예산 세트 사용자 ID"
                   disabled={!isRegistered}
                 />
               </label>
-              <div className="persona-card">
-                <span>선택한 페르소나</span>
-                <strong>{selectedPersonaLabel}</strong>
-              </div>
-              <div className="persona-card">
-                <span>추천에 반영된 성향</span>
-                <strong>{activeBundle.persona}</strong>
-              </div>
               <label className="user-id-field budget-field">
                 <span>예산</span>
                 <input
@@ -867,39 +843,11 @@ function App() {
                   value={budget}
                   onChange={(event) => setBudget(event.target.value)}
                   placeholder="예: 200000"
-                  aria-label="추천 예산"
+                  aria-label="예산 세트 예산"
                 />
               </label>
             </div>
             <div className="recommendation-actions">
-              <div className="topn-group" role="group" aria-label="Top N 추천 개수">
-                {[3, 5].map((count) => (
-                  <button
-                    key={count}
-                    type="button"
-                    className={topN === count ? "mini-button active" : "mini-button"}
-                    onClick={() => setTopN(count)}
-                  >
-                    Top {count}
-                  </button>
-                ))}
-              </div>
-              <button
-                type="button"
-                className="primary-button"
-                onClick={refreshRecommendations}
-                disabled={isRefreshingRecommendations || !isRegistered}
-              >
-                {isRefreshingRecommendations ? "불러오는 중..." : "추천 다시 보기"}
-              </button>
-              <button
-                type="button"
-                className="primary-button"
-                onClick={generateRecommendationReasons}
-                disabled={isGeneratingReasons || isRefreshingRecommendations || !isRegistered}
-              >
-                {isGeneratingReasons ? "이유 생성 중..." : "AI 추천 이유"}
-              </button>
               <button
                 type="button"
                 className="primary-button"
@@ -911,92 +859,7 @@ function App() {
             </div>
           </div>
 
-          <div className="weight-panel">
-            <div className="weight-copy">
-              <p className="eyebrow">Recommendation Control</p>
-              <h4>개인화와 대중성의 비중을 조절합니다</h4>
-              <p>
-                슬라이더를 움직이면 추천 결과에서 취향 반영 강도와 대중성을 함께 조절할 수 있습니다.
-              </p>
-            </div>
-            <div className="weight-control">
-              <div className="weight-labels">
-                <span>개인화 {recommendationWeight}%</span>
-                <span>대중성 {popularityWeight}%</span>
-              </div>
-              <input
-                type="range"
-                min="0"
-                max="100"
-                value={recommendationWeight}
-                onChange={(event) => setRecommendationWeight(Number(event.target.value))}
-                aria-label="개인화와 대중성 비중 조절"
-              />
-            </div>
-          </div>
-
-          {!isRegistered ? (
-            <p className="status-text">사용자 설정과 취향 분석을 마치면 추천 결과가 여기에 표시됩니다.</p>
-          ) : null}
-          {recommendationError ? <p className="status-text">{recommendationError}</p> : null}
-          {isRefreshingRecommendations ? (
-            <p className="status-text">최신 추천 결과를 불러오는 중입니다.</p>
-          ) : null}
-          {isGeneratingReasons ? (
-            <p className="status-text">AI가 현재 추천 리스트의 이유를 생성하는 중입니다.</p>
-          ) : null}
           {budgetSetError ? <p className="status-text">{budgetSetError}</p> : null}
-
-          <div className="stage-list">
-            {activeBundle.stages.map((stage) => (
-              <div key={stage.label} className="stage-chip">
-                <strong>{stage.label}</strong>
-                <span>{stage.value}</span>
-              </div>
-            ))}
-          </div>
-
-          <div className="recommendation-list">
-            {activeBundle.items.map((item) => (
-              <article
-                key={item.id}
-                className="result-card"
-                onClick={() => handleRecommendationClick(item.id)}
-              >
-                <ResultVisual imageUrl={item.imageUrl} title={item.title} accent={item.accent} />
-                <div className="result-meta">
-                  <div className="result-topline">
-                    <p>
-                      #{item.rank} · {item.brand}
-                    </p>
-                    <strong>{item.price}</strong>
-                  </div>
-                  <h4>{item.title}</h4>
-                  <div className="reason-callout">
-                    <span className="reason-label">추천 이유</span>
-                    <p>{item.reason}</p>
-                  </div>
-                  <div className="result-stats">
-                    <span className="badge">추천 점수 {(item.score * 100).toFixed(1)}%</span>
-                    <span className="badge">{userId}</span>
-                    <span className="badge">{activeBundle.persona}</span>
-                    <span className="badge">예산 {budgetLabel}</span>
-                  </div>
-                </div>
-              </article>
-            ))}
-          </div>
-
-          <div className="section-heading" style={{ marginTop: 24 }}>
-            <div>
-              <p className="eyebrow">Budget Set</p>
-              <h3>예산 안에서 구성한 추천 세트</h3>
-            </div>
-            <div className="heading-metrics">
-              <span className="metric">예산 {budgetLabel}</span>
-              <span className="metric">세트 수 {budgetSets.setCount}</span>
-            </div>
-          </div>
 
           {budgetSets.sets.length === 0 ? (
             <p className="status-text">예산 안에서 세트 보기를 누르면 추천 조합 결과가 여기에 표시됩니다.</p>
