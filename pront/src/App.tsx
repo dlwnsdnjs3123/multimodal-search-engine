@@ -501,6 +501,9 @@ function App() {
   const selectedPersona =
     personaOptions.find((persona) => persona.key === selectedOnboardingPersona) ?? null;
   const selectedPersonaLabel = selectedPersona?.name ?? selectedOnboardingPersona;
+  const rankedPersonas = personaOptions
+    .filter((persona) => (personaScores[persona.key] ?? 0) > 0)
+    .sort((left, right) => (personaScores[right.key] ?? 0) - (personaScores[left.key] ?? 0));
   const activeSearchResults = searchResultView === "personalized" ? personalizedResults : results;
   const activeSearchLatency = searchResultView === "personalized" ? personalizedLatency : activeLatency;
   const activeSearchScoreLabel = searchResultView === "personalized" ? "추천 점수" : "유사도";
@@ -561,21 +564,28 @@ function App() {
             </div>
           </div>
 
-          {selectedPersona && Object.keys(personaScores).length > 0 ? (
+          {rankedPersonas.length > 0 ? (
             <div className="persona-grid">
-              <article className="persona-option active">
-                <p className="persona-name">{selectedPersona.name}</p>
-                <h2>{selectedPersona.title}</h2>
-                <p className="persona-summary">{selectedPersona.summary}</p>
-                <strong>{personaScores[selectedPersona.key] ?? 0}%</strong>
-                <div className="persona-traits">
-                  {selectedPersona.traits.map((trait) => (
-                    <span key={trait} className="badge">
-                      {trait}
-                    </span>
-                  ))}
-                </div>
-              </article>
+              {rankedPersonas.map((persona) => (
+                <article
+                  key={persona.key}
+                  className={
+                    persona.key === selectedOnboardingPersona ? "persona-option active" : "persona-option"
+                  }
+                >
+                  <p className="persona-name">{persona.name}</p>
+                  <h2>{persona.title}</h2>
+                  <p className="persona-summary">{persona.summary}</p>
+                  <strong>{personaScores[persona.key] ?? 0}%</strong>
+                  <div className="persona-traits">
+                    {persona.traits.map((trait) => (
+                      <span key={trait} className="badge">
+                        {trait}
+                      </span>
+                    ))}
+                  </div>
+                </article>
+              ))}
             </div>
           ) : null}
 
