@@ -5,7 +5,10 @@ import base64
 import http.client
 import json
 import math
+import os
+import platform
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -75,17 +78,24 @@ DEFAULT_SAMPLE_SIZE = 200
 DEFAULT_MIN_RELEVANT = 2
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_RANDOM_SEED = 42
+DEFAULT_WARMUP_CALLS = 10
+DEFAULT_MEASURED_CALLS = 100
+LATENCY_TARGET_MS = 200.0
+CPU_ONLY_TOLERANCE_MS = 50.0
 SEARCH_DOC_REPORT_PATH = REPO_ROOT / "docs" / "search_experiments.md"
 SEARCH_JSON_REPORT_PATH = REPO_ROOT / "evaluation" / "search_metrics_report.json"
 SEARCH_EVAL_SET_PATH = REPO_ROOT / "evaluation" / "search_eval_set.csv"
 DEV_META_PATH = REPO_ROOT / "data" / "faiss_index" / "search_dev_v2_metadata.json"
 TEST_META_PATH = REPO_ROOT / "data" / "faiss_index" / "search_test_v2_metadata.json"
 PROD_META_PATH = REPO_ROOT / "data" / "faiss_index" / "search_v2_metadata.json"
+PROCESSED_DATA_ROOT = REPO_ROOT / "data" / "processed"
 DEV_TEST_EVENTS_PATH = REPO_ROOT / "data" / "processed" / "test_events_dev.csv"
 DEV_SPLIT_SUMMARY_PATH = REPO_ROOT / "data" / "processed" / "event_split_summary_dev.json"
 _LOCAL_ENGINE_CACHE: dict[str, Any] = {}
 REQUEST_RETRIES = 3
 REQUEST_RETRY_SLEEP_SEC = 1.0
+HEALTH_REQUEST_RETRIES = 30
+HEALTH_REQUEST_RETRY_SLEEP_SEC = 2.0
 
 
 def _tokenize(text: str) -> list[str]:
@@ -125,9 +135,7 @@ def _load_items_from_metadata(meta_path: Path) -> pd.DataFrame:
 
 
 def _load_items_from_engine(mode: str) -> pd.DataFrame:
-    from search_engine import MultimodalSearchEngine
-
-    engine = MultimodalSearchEngine(mode=mode)
+    engine = _get_local_engine(mode)
     rows: list[dict[str, Any]] = []
     for item in engine.items:
         metadata = dict(item.metadata or {})
@@ -172,7 +180,13 @@ def _get_local_engine(mode: str):
         return engine
     from search_engine import MultimodalSearchEngine
 
-    engine = MultimodalSearchEngine(mode=mode)
+    data_root = os.getenv("SEARCH_ENGINE_DATA_ROOT") or os.getenv("DATA_ROOT") or str(PROCESSED_DATA_ROOT)
+    cache_dir = REPO_ROOT / "data" / "faiss_index"
+    engine = MultimodalSearchEngine.load_cached_or_build(
+        mode=mode,
+        data_root=data_root,
+        cache_dir=cache_dir,
+    )
     _LOCAL_ENGINE_CACHE[mode] = engine
     return engine
 
@@ -541,26 +555,48 @@ def _health_endpoint(endpoint: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
 
+def _candidate_endpoints(endpoint: str) -> list[str]:
+    parts = urlsplit(endpoint)
+    hostname = parts.hostname or ""
+    candidates = [endpoint]
+    if hostname == "127.0.0.1":
+        alt_netloc = parts.netloc.replace("127.0.0.1", "localhost")
+        candidates.append(urlunsplit((parts.scheme, alt_netloc, parts.path, parts.query, parts.fragment)))
+    elif hostname == "localhost":
+        alt_netloc = parts.netloc.replace("localhost", "127.0.0.1")
+        candidates.append(urlunsplit((parts.scheme, alt_netloc, parts.path, parts.query, parts.fragment)))
+    deduped: list[str] = []
+    for candidate in candidates:
+        if candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
 def _fetch_endpoint_health(endpoint: str, timeout: float) -> dict[str, Any]:
-    health_url = _health_endpoint(endpoint)
     last_error: Exception | None = None
-    for attempt in range(REQUEST_RETRIES):
-        try:
-            with urllib.request.urlopen(health_url, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {exc.code} from {health_url}: {detail}") from exc
-        except (urllib.error.URLError, http.client.RemoteDisconnected, ConnectionResetError) as exc:
-            last_error = exc
-            if attempt < REQUEST_RETRIES - 1:
-                time.sleep(REQUEST_RETRY_SLEEP_SEC)
-                continue
-            raise RuntimeError(
-                f"Failed to connect to {health_url}: {exc}. "
-                "On this machine, try 127.0.0.1 instead of localhost if the server is already running."
-            ) from exc
-    raise RuntimeError(f"Failed to connect to {health_url}: {last_error}")
+    for candidate in _candidate_endpoints(endpoint):
+        health_url = _health_endpoint(candidate)
+        for attempt in range(HEALTH_REQUEST_RETRIES):
+            try:
+                with urllib.request.urlopen(health_url, timeout=timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                    payload["_resolved_endpoint"] = candidate
+                    payload["_health_url"] = health_url
+                    return payload
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"HTTP {exc.code} from {health_url}: {detail}") from exc
+            except (urllib.error.URLError, http.client.RemoteDisconnected, ConnectionResetError, TimeoutError, OSError) as exc:
+                last_error = exc
+                if attempt < HEALTH_REQUEST_RETRIES - 1:
+                    time.sleep(HEALTH_REQUEST_RETRY_SLEEP_SEC)
+                    continue
+                break
+    raise RuntimeError(
+        f"Failed to connect to {_health_endpoint(endpoint)}: {last_error}. "
+        "The search-engine container may still be starting, or the host port may be unstable. "
+        "Confirm docker-compose up is still running and retry after the search-engine health endpoint responds."
+    )
 
 
 def _infer_mode_from_health(health: dict[str, Any]) -> str | None:
@@ -594,8 +630,9 @@ def _infer_mode_from_health(health: dict[str, Any]) -> str | None:
     return None
 
 
-def _resolve_eval_mode(requested_mode: str, endpoint: str, timeout: float) -> tuple[str, dict[str, Any]]:
+def _resolve_eval_mode(requested_mode: str, endpoint: str, timeout: float) -> tuple[str, dict[str, Any], str]:
     health = _fetch_endpoint_health(endpoint, timeout)
+    resolved_endpoint = str(health.get("_resolved_endpoint", endpoint))
     endpoint_mode = _infer_mode_from_health(health)
     if endpoint_mode not in {"test", "dev", "production"}:
         raise RuntimeError(
@@ -605,16 +642,16 @@ def _resolve_eval_mode(requested_mode: str, endpoint: str, timeout: float) -> tu
         )
 
     if requested_mode == "auto":
-        return endpoint_mode, health
+        return endpoint_mode, health, resolved_endpoint
 
     if requested_mode != endpoint_mode:
         raise RuntimeError(
             "Evaluation mode does not match the running search engine. "
-            f"Requested mode={requested_mode}, endpoint mode={endpoint_mode}, endpoint={endpoint}. "
+            f"Requested mode={requested_mode}, endpoint mode={endpoint_mode}, endpoint={resolved_endpoint}. "
             "Use --mode to match the server or restart the search engine with the intended mode."
         )
 
-    return requested_mode, health
+    return requested_mode, health, resolved_endpoint
 
 
 def _resolve_query_image_base64(row: Any, endpoint: str, timeout: float, mode: str) -> str:
@@ -644,26 +681,67 @@ def _mode_payload(modality: str, row: Any, endpoint: str, timeout: float, mode: 
     return str(row.query), image_b64
 
 
-def _warm_up_modality(
+def _runtime_environment() -> dict[str, Any]:
+    ram_gb: float | None = None
+    try:
+        if hasattr(os, "sysconf") and "SC_PAGE_SIZE" in os.sysconf_names and "SC_PHYS_PAGES" in os.sysconf_names:
+            ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
+    except Exception:
+        ram_gb = None
+
+    gpu_enabled = False
+    gpu_name = ""
+    try:
+        import torch
+
+        gpu_enabled = bool(torch.cuda.is_available())
+        if gpu_enabled:
+            gpu_name = str(torch.cuda.get_device_name(0))
+    except Exception:
+        gpu_enabled = False
+        gpu_name = ""
+
+    return {
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "cpu_count": os.cpu_count(),
+        "ram_gb": round(float(ram_gb), 2) if ram_gb is not None else None,
+        "gpu_enabled": gpu_enabled,
+        "gpu_name": gpu_name,
+        "execution_context": "container" if Path("/.dockerenv").exists() else "host",
+    }
+
+
+def _effective_latency_threshold_ms(runtime_environment: dict[str, Any]) -> float:
+    if runtime_environment.get("gpu_enabled"):
+        return LATENCY_TARGET_MS
+    return LATENCY_TARGET_MS + CPU_ONLY_TOLERANCE_MS
+
+
+def _prepare_modality_samples(
     eval_df: pd.DataFrame,
     endpoint: str,
     modality: str,
-    top_k: int,
     timeout: float,
     mode: str,
-) -> None:
-    if eval_df.empty:
-        return
-    first_row = next(eval_df.itertuples(index=False))
-    query_text, image_b64 = _mode_payload(modality, first_row, endpoint, timeout, mode)
-    _post_search(
-        endpoint=endpoint,
-        query=query_text,
-        image_base64=image_b64,
-        top_k=top_k,
-        timeout=timeout,
-        use_cache=False,
-    )
+) -> tuple[list[dict[str, Any]], int]:
+    prepared: list[dict[str, Any]] = []
+    skipped = 0
+    for row in eval_df.itertuples(index=False):
+        try:
+            query_text, image_b64 = _mode_payload(modality, row, endpoint, timeout, mode)
+        except Exception:
+            skipped += 1
+            continue
+        prepared.append(
+            {
+                "row": row,
+                "query": query_text,
+                "image_base64": image_b64,
+            }
+        )
+    return prepared, skipped
 
 
 def evaluate_modality(
@@ -674,29 +752,68 @@ def evaluate_modality(
     metric_k: int,
     timeout: float,
     mode: str,
+    warmup_calls: int,
+    measured_calls: int,
+    latency_threshold_ms: float,
 ) -> dict[str, Any]:
-    # Warm up CLIP model/image cache so the report reflects steady-state search latency
-    # rather than one-time startup costs from the first multimodal request.
-    _warm_up_modality(eval_df, endpoint, modality, top_k, timeout, mode)
+    prepared_samples, skipped_queries = _prepare_modality_samples(
+        eval_df=eval_df,
+        endpoint=endpoint,
+        modality=modality,
+        timeout=timeout,
+        mode=mode,
+    )
 
-    ranked_lists: list[list[str]] = []
-    relevant_lists: list[list[str]] = []
-    api_latencies: list[float] = []
-    wall_latencies: list[float] = []
-    rows: list[dict[str, Any]] = []
+    if not prepared_samples:
+        return {
+            "available": False,
+            "unavailable_reason": f"No usable {modality} queries were available in the current environment.",
+            "samples_evaluated": 0,
+            "usable_queries": 0,
+            "skipped_queries": skipped_queries,
+            "warmup_calls": 0,
+            "measured_calls": 0,
+            f"HitRate@{metric_k}": 0.0,
+            "MRR": 0.0,
+            f"NDCG@{metric_k}": 0.0,
+            "avg_latency_ms": 0.0,
+            "avg_api_latency_ms": 0.0,
+            "p95_latency_ms": 0.0,
+            "avg_wall_latency_ms": 0.0,
+            "p95_wall_latency_ms": 0.0,
+            "checks": {
+                "latency_within_threshold": False,
+                "mrr_meets_target": False,
+                "ndcg_meets_target": False,
+            },
+            "rows": [],
+        }
 
-    for row in eval_df.itertuples(index=False):
-        query_text, image_b64 = _mode_payload(modality, row, endpoint, timeout, mode)
-        started = time.perf_counter()
-        response = _post_search(
+    for index in range(max(0, int(warmup_calls))):
+        sample = prepared_samples[index % len(prepared_samples)]
+        _post_search(
             endpoint=endpoint,
-            query=query_text,
-            image_base64=image_b64,
+            query=sample["query"],
+            image_base64=sample["image_base64"],
             top_k=top_k,
             timeout=timeout,
             use_cache=False,
         )
-        wall_ms = (time.perf_counter() - started) * 1000.0
+
+    ranked_lists: list[list[str]] = []
+    relevant_lists: list[list[str]] = []
+    rows: list[dict[str, Any]] = []
+
+    for sample in prepared_samples:
+        row = sample["row"]
+        response = _post_search(
+            endpoint=endpoint,
+            query=sample["query"],
+            image_base64=sample["image_base64"],
+            top_k=top_k,
+            timeout=timeout,
+            use_cache=False,
+        )
 
         ranked_items = [
             _normalize_article_id(item.get("product_id", ""))
@@ -724,8 +841,6 @@ def evaluate_modality(
 
         ranked_lists.append(ranked_items)
         relevant_lists.append(relevant_items)
-        api_latencies.append(float(response.get("latency_ms", wall_ms)))
-        wall_latencies.append(wall_ms)
         rows.append(
             {
                 "query_id": row.query_id,
@@ -734,7 +849,33 @@ def evaluate_modality(
                 "search_type": response.get("search_type", modality),
                 "relevant_items": relevant_items,
                 "ranked_items": ranked_items,
-                "latency_ms": float(response.get("latency_ms", wall_ms)),
+            }
+        )
+
+    api_latencies: list[float] = []
+    wall_latencies: list[float] = []
+    latency_rows: list[dict[str, Any]] = []
+    for index in range(max(1, int(measured_calls))):
+        sample = prepared_samples[index % len(prepared_samples)]
+        row = sample["row"]
+        started = time.perf_counter()
+        response = _post_search(
+            endpoint=endpoint,
+            query=sample["query"],
+            image_base64=sample["image_base64"],
+            top_k=top_k,
+            timeout=timeout,
+            use_cache=False,
+        )
+        wall_ms = (time.perf_counter() - started) * 1000.0
+        api_ms = float(response.get("latency_ms", wall_ms))
+        api_latencies.append(api_ms)
+        wall_latencies.append(wall_ms)
+        latency_rows.append(
+            {
+                "query_id": row.query_id,
+                "search_type": response.get("search_type", modality),
+                "latency_ms": api_ms,
                 "wall_latency_ms": wall_ms,
             }
         )
@@ -748,7 +889,12 @@ def evaluate_modality(
     p95_wall_latency = float(pd.Series(wall_latencies).quantile(0.95))
 
     return {
+        "available": True,
         "samples_evaluated": len(rows),
+        "usable_queries": len(prepared_samples),
+        "skipped_queries": skipped_queries,
+        "warmup_calls": int(warmup_calls),
+        "measured_calls": int(measured_calls),
         f"HitRate@{metric_k}": hitrate,
         "MRR": mrr,
         f"NDCG@{metric_k}": ndcg,
@@ -758,11 +904,12 @@ def evaluate_modality(
         "avg_wall_latency_ms": avg_wall_latency,
         "p95_wall_latency_ms": p95_wall_latency,
         "checks": {
-            "latency_within_200ms": avg_api_latency <= 200.0,
+            "latency_within_threshold": p95_wall_latency <= latency_threshold_ms,
             "mrr_meets_target": mrr >= 0.55,
             "ndcg_meets_target": ndcg >= 0.50,
         },
         "rows": rows,
+        "latency_rows": latency_rows,
     }
 
 
@@ -847,13 +994,32 @@ def evaluate_bm25_baseline(
 
 
 def _overall_summary(modalities: dict[str, dict[str, Any]], metric_k: int) -> tuple[dict[str, Any], dict[str, bool]]:
-    total_samples = sum(int(result.get("samples_evaluated", 0) or 0) for result in modalities.values())
+    available_modalities = [result for result in modalities.values() if result.get("available", True)]
+    if not available_modalities:
+        summary = {
+            f"HitRate@{metric_k}": 0.0,
+            "MRR": 0.0,
+            f"NDCG@{metric_k}": 0.0,
+            "avg_latency_ms": 0.0,
+            "p95_latency_ms": 0.0,
+            "avg_wall_latency_ms": 0.0,
+            "p95_wall_latency_ms": 0.0,
+        }
+        checks = {
+            "latency_within_threshold": False,
+            "mrr_meets_target": False,
+            "ndcg_meets_target": False,
+            "all_modalities_available": False,
+        }
+        return summary, checks
+
+    total_samples = sum(int(result.get("samples_evaluated", 0) or 0) for result in available_modalities)
     if total_samples <= 0:
-        total_samples = max(len(modalities), 1)
+        total_samples = max(len(available_modalities), 1)
 
     def _weighted_average(field: str) -> float:
         weighted_sum = 0.0
-        for result in modalities.values():
+        for result in available_modalities:
             weight = int(result.get("samples_evaluated", 0) or 0) or 1
             weighted_sum += float(result[field]) * weight
         return weighted_sum / total_samples
@@ -861,19 +1027,24 @@ def _overall_summary(modalities: dict[str, dict[str, Any]], metric_k: int) -> tu
     avg_mrr = _weighted_average("MRR")
     avg_ndcg = _weighted_average(f"NDCG@{metric_k}")
     avg_latency = _weighted_average("avg_latency_ms")
+    avg_wall_latency = _weighted_average("avg_wall_latency_ms")
     avg_hit_rate = _weighted_average(f"HitRate@{metric_k}")
-    p95_latency = max(result["p95_latency_ms"] for result in modalities.values())
+    p95_latency = max(result["p95_latency_ms"] for result in available_modalities)
+    p95_wall_latency = max(result["p95_wall_latency_ms"] for result in available_modalities)
     summary = {
         f"HitRate@{metric_k}": avg_hit_rate,
         "MRR": avg_mrr,
         f"NDCG@{metric_k}": avg_ndcg,
         "avg_latency_ms": avg_latency,
         "p95_latency_ms": p95_latency,
+        "avg_wall_latency_ms": avg_wall_latency,
+        "p95_wall_latency_ms": p95_wall_latency,
     }
     checks = {
-        "latency_within_200ms": avg_latency <= 200.0,
+        "latency_within_threshold": all(result["checks"]["latency_within_threshold"] for result in available_modalities),
         "mrr_meets_target": avg_mrr >= 0.55,
         "ndcg_meets_target": avg_ndcg >= 0.50,
+        "all_modalities_available": len(available_modalities) == len(modalities),
     }
     return summary, checks
 
@@ -911,7 +1082,7 @@ def write_markdown_report(
     lines.append("")
     lines.append("## 데이터 구성 및 분할")
     lines.append("")
-    lines.append("- 원본 상품 카탈로그: `data/raw/articles.csv`")
+    lines.append("- 상품 메타데이터: `data/processed/item_master_dev.csv`, `data/processed/articles_feature.csv`, `data/processed/item_features_dev.csv`")
     lines.append("- 이미지 소스: 설정된 이미지 루트의 H&M 상품 이미지 파일")
     lines.append("- 검색 검증용 코퍼스: `random_seed=42`로 고정 추출한 `dev` 이미지 포함 subset")
     lines.append("- 쿼리 구성 방식: `colour_group_name + product_type_name` 기반 canonical query로 그룹화하고, 관련 상품이 2개 이상이며 쿼리용 이미지가 1개 이상 있는 그룹만 사용")
@@ -999,7 +1170,7 @@ def write_search_markdown_report_v2(
     lines.append("")
     lines.append("## 데이터 구성 및 분할")
     lines.append("")
-    lines.append("- 상품 메타데이터: `data/raw/articles.csv`")
+    lines.append("- 상품 메타데이터: `data/processed/item_master_dev.csv`, `data/processed/articles_feature.csv`, `data/processed/item_features_dev.csv`")
     lines.append("- 이미지 데이터: `D:/imagedata/<첫 세 자리>/<article_id>.jpg`")
     lines.append("- 검색 인덱스 입력: raw article 메타데이터와 이미지 경로를 매칭한 멀티모달 catalog")
     lines.append("- 분할 방식: 시간 기반 `train / valid / test = 8 / 1 / 1`")
@@ -1075,6 +1246,296 @@ def write_search_markdown_report_v2(
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_search_markdown_report_v3(
+    report: dict[str, Any],
+    output_path: Path,
+    eval_df: pd.DataFrame,
+) -> None:
+    metadata = report["metadata"]
+    metric_k = metadata["metric_k"]
+    split_summary = report.get("split_summary", {})
+    runtime = metadata["runtime_environment"]
+    protocol = metadata["measurement_protocol"]
+    checklist = report.get("performance_checklist", [])
+    modality_labels = {"text": "텍스트", "image": "이미지", "hybrid": "하이브리드"}
+
+    def _fmt_bool(value: bool) -> str:
+        return "예" if value else "아니오"
+
+    lines: list[str] = []
+    lines.append("# 검색 엔진 실험 리포트")
+    lines.append("")
+    lines.append("## 실행 정보")
+    lines.append("")
+    lines.append(f"- 생성 시각: {metadata['generated_at']}")
+    lines.append(f"- 실행 모드: `{metadata['mode']}`")
+    lines.append(f"- 검색 엔드포인트: `{metadata['endpoint']}`")
+    lines.append(f"- 재현 시드: `{metadata['random_seed']}`")
+    lines.append(f"- 평가된 원본 쿼리 수: `{metadata['samples_evaluated']}`")
+    lines.append(f"- 평가셋 최대 샘플 수: `{metadata['sample_size']}`")
+    lines.append("")
+    lines.append("## 실측 환경")
+    lines.append("")
+    lines.append(f"- 실행 위치: `{runtime.get('execution_context', 'unknown')}`")
+    lines.append(f"- 호스트명: `{runtime.get('hostname', 'unknown')}`")
+    lines.append(f"- 플랫폼: `{runtime.get('platform', 'unknown')}`")
+    lines.append(f"- Python: `{runtime.get('python', 'unknown')}`")
+    lines.append(f"- CPU 코어 수: `{runtime.get('cpu_count', 'unknown')}`")
+    lines.append(f"- 메모리(RAM): `{runtime.get('ram_gb', 'unknown')} GB`")
+    lines.append(
+        f"- GPU 사용 여부: `{_fmt_bool(bool(runtime.get('gpu_enabled')))}"
+        f"{' (' + str(runtime.get('gpu_name')) + ')' if runtime.get('gpu_name') else ''}`"
+    )
+    lines.append("")
+    lines.append("## 데이터 구성 및 분할")
+    lines.append("")
+    lines.append("- 상품 메타데이터: `data/processed/item_master_dev.csv`, `data/processed/articles_feature.csv`, `data/processed/item_features_dev.csv`")
+    lines.append("- 이미지 데이터: `SEARCH_ENGINE_IMAGE_ROOT/<앞 3자리>/<article_id>.jpg`")
+    lines.append("- 평가셋 생성 기준: 현재 인덱스에 실제로 존재하는 상품만 사용")
+    lines.append("- relevance 정의: 같은 canonical query bucket에 속한 상품 집합")
+    lines.append("- canonical query 생성 기준: `colour_group_name + product_type_name`")
+    lines.append("- 이미지/하이브리드 평가는 query에 사용한 동일 상품 id를 정답 집합과 예측 순위에서 제외")
+    lines.append("- 데이터 분할 규격: `train / valid / test = 8 / 1 / 1` (시간 기반)")
+    if split_summary:
+        ratios = split_summary.get("ratios", {})
+        lines.append(
+            f"- 실제 split summary: train={ratios.get('train', 'n/a')}, valid={ratios.get('valid', 'n/a')}, test={ratios.get('test', 'n/a')}"
+        )
+        test_info = split_summary.get("test", {})
+        if test_info:
+            lines.append(
+                f"- test split: rows={test_info.get('row_count', 'n/a')}, unique_sessions={test_info.get('unique_sessions', 'n/a')}, "
+                f"기간={test_info.get('first_timestamp', 'n/a')} ~ {test_info.get('last_timestamp', 'n/a')}"
+            )
+    lines.append("")
+    lines.append("## 측정 프로토콜")
+    lines.append("")
+    lines.append(f"- warm-up 호출 수: `{protocol['warmup_calls']}`")
+    lines.append(f"- latency 측정 호출 수: `{protocol['measured_calls']}`")
+    lines.append("- 동시 요청 조건: `single request`")
+    lines.append("- 시간 지표 판정 기준: `100회 호출의 p95 wall latency`")
+    lines.append("- query-side cache: `비활성화(use_cache=false)`")
+    lines.append(f"- 기준 latency: `{protocol['latency_target_ms']} ms`")
+    lines.append(f"- CPU 전용 허용 오차: `±{protocol['cpu_only_tolerance_ms']} ms`")
+    lines.append(f"- 현재 적용된 latency 판정 상한: `{protocol['effective_latency_threshold_ms']} ms`")
+    lines.append("")
+    lines.append("## 지표 정의")
+    lines.append("")
+    lines.append("- `MRR`: 첫 relevant item의 역순위 평균")
+    lines.append(f"- `NDCG@{metric_k}`: 상위 {metric_k}개 결과의 정규화된 누적 이득")
+    lines.append(f"- `HitRate@{metric_k}`: 상위 {metric_k}개 안에 정답이 하나 이상 포함될 확률")
+    lines.append("- `API Latency`: 서버 응답 JSON 내부 `latency_ms`")
+    lines.append("- `Wall Latency`: 평가 스크립트가 직접 측정한 종단간 응답 시간")
+    lines.append("")
+    lines.append("## 모달리티별 결과")
+    lines.append("")
+    lines.append("| 모달리티 | 사용 가능 | 품질 샘플 수 | 스킵 수 | MRR | NDCG@10 | HitRate@10 | 평균 API(ms) | P95 API(ms) | 평균 Wall(ms) | P95 Wall(ms) | 목표 통과 |")
+    lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
+    for modality, result in report["modalities"].items():
+        if not result.get("available", True):
+            lines.append(
+                f"| {modality_labels.get(modality, modality)} | 아니오 | 0 | {result.get('skipped_queries', 0)} | 0.0000 | 0.0000 | 0.0000 | 0.00 | 0.00 | 0.00 | 0.00 | UNAVAILABLE |"
+            )
+            lines.append(f"- {modality_labels.get(modality, modality)} 미측정 사유: {result.get('unavailable_reason', 'unknown')}")
+            continue
+        status = "PASS" if all(result["checks"].values()) else "FAIL"
+        lines.append(
+            f"| {modality_labels.get(modality, modality)} | 예 | {result['samples_evaluated']} | {result['skipped_queries']} | "
+            f"{result['MRR']:.4f} | {result[f'NDCG@{metric_k}']:.4f} | {result[f'HitRate@{metric_k}']:.4f} | "
+            f"{result['avg_api_latency_ms']:.2f} | {result['p95_latency_ms']:.2f} | {result['avg_wall_latency_ms']:.2f} | "
+            f"{result['p95_wall_latency_ms']:.2f} | {status} |"
+        )
+    lines.append("")
+    lines.append("## 종합 결과")
+    lines.append("")
+    lines.append(f"- 종합 MRR: `{report['search']['MRR']:.4f}`")
+    lines.append(f"- 종합 NDCG@{metric_k}: `{report['search'][f'NDCG@{metric_k}']:.4f}`")
+    lines.append(f"- 종합 평균 API latency: `{report['search']['avg_latency_ms']:.2f} ms`")
+    lines.append(f"- 종합 P95 API latency: `{report['search']['p95_latency_ms']:.2f} ms`")
+    lines.append(f"- 종합 평균 Wall latency: `{report['search']['avg_wall_latency_ms']:.2f} ms`")
+    lines.append(f"- 종합 P95 Wall latency: `{report['search']['p95_wall_latency_ms']:.2f} ms`")
+    lines.append(f"- 전체 latency 기준 충족 여부: `{'PASS' if report['checks']['latency_within_threshold'] else 'FAIL'}`")
+    lines.append(f"- 전체 MRR 기준 충족 여부: `{'PASS' if report['checks']['mrr_meets_target'] else 'FAIL'}`")
+    lines.append(f"- 전체 NDCG 기준 충족 여부: `{'PASS' if report['checks']['ndcg_meets_target'] else 'FAIL'}`")
+    lines.append(f"- 모든 모달리티 측정 가능 여부: `{'YES' if report['checks']['all_modalities_available'] else 'NO'}`")
+    lines.append("")
+    lines.append("## 베이스라인 비교")
+    lines.append("")
+    lines.append("- 검색 베이스라인: `BM25 text-only`")
+    lines.append(f"- BM25 MRR: `{report['baseline']['text']['MRR']:.4f}`")
+    lines.append(f"- BM25 NDCG@{metric_k}: `{report['baseline']['text'][f'NDCG@{metric_k}']:.4f}`")
+    lines.append(f"- CLIP text MRR 개선폭: `{report['baseline']['text_improvement']['MRR_delta']:+.4f}`")
+    lines.append(f"- CLIP text NDCG@{metric_k} 개선폭: `{report['baseline']['text_improvement'][f'NDCG@{metric_k}_delta']:+.4f}`")
+    lines.append("")
+    lines.append("## 성능 개선 체크리스트")
+    lines.append("")
+    lines.append("| 항목 | 상태 | 비고 |")
+    lines.append("| --- | --- | --- |")
+    for entry in checklist:
+        lines.append(f"| {entry['name']} | {entry['status']} | {entry['notes']} |")
+    lines.append("")
+    lines.append("## 쿼리 미리보기")
+    lines.append("")
+    preview = eval_df.head(10)[["query_id", "query", "query_product_id", "relevant_count", "source_split"]]
+    lines.append("| query_id | query | 대표 상품 id | relevant 수 | source |")
+    lines.append("| --- | --- | --- | ---: | --- |")
+    for row in preview.itertuples(index=False):
+        lines.append(
+            f"| {row.query_id} | {str(row.query).replace('|', '/')} | {row.query_product_id} | {row.relevant_count} | {row.source_split} |"
+        )
+    lines.append("")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_search_markdown_report_v4(
+    report: dict[str, Any],
+    output_path: Path,
+    eval_df: pd.DataFrame,
+) -> None:
+    metadata = report["metadata"]
+    metric_k = metadata["metric_k"]
+    split_summary = report.get("split_summary", {})
+    runtime = metadata["runtime_environment"]
+    protocol = metadata["measurement_protocol"]
+    checklist = report.get("performance_checklist", [])
+    modality_labels = {"text": "텍스트", "image": "이미지", "hybrid": "하이브리드"}
+
+    def _fmt_bool(value: bool) -> str:
+        return "예" if value else "아니오"
+
+    lines: list[str] = []
+    lines.append("# 검색 엔진 실험 리포트")
+    lines.append("")
+    lines.append("## 실행 정보")
+    lines.append("")
+    lines.append(f"- 생성 시각: {metadata['generated_at']}")
+    lines.append(f"- 실행 모드: `{metadata['mode']}`")
+    lines.append(f"- 검색 엔드포인트: `{metadata['endpoint']}`")
+    lines.append(f"- 재현 시드: `{metadata['random_seed']}`")
+    lines.append(f"- 평가에 사용된 쿼리 수: `{metadata['samples_evaluated']}`")
+    lines.append(f"- 최대 샘플 수 제한: `{metadata['sample_size']}`")
+    lines.append("")
+    lines.append("## 실측 환경")
+    lines.append("")
+    lines.append(f"- 실행 위치: `{runtime.get('execution_context', 'unknown')}`")
+    lines.append(f"- 호스트명: `{runtime.get('hostname', 'unknown')}`")
+    lines.append(f"- 플랫폼: `{runtime.get('platform', 'unknown')}`")
+    lines.append(f"- Python: `{runtime.get('python', 'unknown')}`")
+    lines.append(f"- CPU 코어 수: `{runtime.get('cpu_count', 'unknown')}`")
+    lines.append(f"- 메모리(RAM): `{runtime.get('ram_gb', 'unknown')} GB`")
+    lines.append(
+        f"- GPU 사용 여부: `{_fmt_bool(bool(runtime.get('gpu_enabled')))}"
+        f"{' (' + str(runtime.get('gpu_name')) + ')' if runtime.get('gpu_name') else ''}`"
+    )
+    lines.append("")
+    lines.append("## 데이터 구성 및 분할")
+    lines.append("")
+    lines.append("- 상품 메타데이터: `data/processed/item_master_dev.csv`, `data/processed/articles_feature.csv`, `data/processed/item_features_dev.csv`")
+    lines.append("- 이미지 경로 규칙: `SEARCH_ENGINE_IMAGE_ROOT/<앞 3자리>/<article_id>.jpg`")
+    lines.append("- 평가셋 생성 기준: 현재 인덱스에 실제로 포함된 상품만 사용")
+    lines.append("- relevance 정의: 동일한 canonical query bucket에 속한 상품 집합")
+    lines.append("- canonical query 생성 기준: `colour_group_name + product_type_name`")
+    lines.append("- 이미지/하이브리드 평가는 query에 사용한 동일 상품 id를 정답 집합과 순위 계산에서 제외")
+    lines.append("- 데이터 분할 규격: `train / valid / test = 8 / 1 / 1` (시간 기반)")
+    if split_summary:
+        ratios = split_summary.get("ratios", {})
+        lines.append(
+            f"- 실제 split summary: train={ratios.get('train', 'n/a')}, valid={ratios.get('valid', 'n/a')}, test={ratios.get('test', 'n/a')}"
+        )
+        test_info = split_summary.get("test", {})
+        if test_info:
+            lines.append(
+                f"- test split 상세: rows={test_info.get('row_count', 'n/a')}, unique_sessions={test_info.get('unique_sessions', 'n/a')}, "
+                f"기간={test_info.get('first_timestamp', 'n/a')} ~ {test_info.get('last_timestamp', 'n/a')}"
+            )
+    lines.append("")
+    lines.append("## 측정 프로토콜")
+    lines.append("")
+    lines.append(f"- warm-up 호출 수: `{protocol['warmup_calls']}`")
+    lines.append(f"- latency 측정 호출 수: `{protocol['measured_calls']}`")
+    lines.append("- 동시 요청 조건: `single request`")
+    lines.append("- 시간 지표 판정 기준: `100회 호출의 p95 wall latency`")
+    lines.append("- query-side cache: `비활성화(use_cache=false)`")
+    lines.append(f"- 기본 latency 목표: `{protocol['latency_target_ms']} ms`")
+    lines.append(f"- CPU 전용 허용 오차: `±{protocol['cpu_only_tolerance_ms']} ms`")
+    lines.append(f"- 현재 적용된 latency 판정 상한: `{protocol['effective_latency_threshold_ms']} ms`")
+    lines.append("")
+    lines.append("## 지표 정의")
+    lines.append("")
+    lines.append("- `MRR`: 첫 relevant item의 역순위 평균")
+    lines.append(f"- `NDCG@{metric_k}`: 상위 {metric_k}개 결과의 정렬 품질을 반영한 누적 이득")
+    lines.append(f"- `HitRate@{metric_k}`: 상위 {metric_k}개 안에 정답이 하나 이상 포함될 비율")
+    lines.append("- `API Latency`: 서버 응답 JSON 내부의 `latency_ms`")
+    lines.append("- `Wall Latency`: 평가 스크립트가 직접 측정한 종단간 응답 시간")
+    lines.append("")
+    lines.append("## 모달리티별 결과")
+    lines.append("")
+    lines.append("| 모달리티 | 사용 가능 | 평가 샘플 수 | 스킵 수 | MRR | NDCG@10 | HitRate@10 | 평균 API(ms) | P95 API(ms) | 평균 Wall(ms) | P95 Wall(ms) | 목표 통과 |")
+    lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
+    for modality, result in report["modalities"].items():
+        if not result.get("available", True):
+            lines.append(
+                f"| {modality_labels.get(modality, modality)} | 아니오 | 0 | {result.get('skipped_queries', 0)} | 0.0000 | 0.0000 | 0.0000 | 0.00 | 0.00 | 0.00 | 0.00 | UNAVAILABLE |"
+            )
+            lines.append(f"- {modality_labels.get(modality, modality)} 미측정 사유: {result.get('unavailable_reason', 'unknown')}")
+            continue
+        status = "PASS" if all(result["checks"].values()) else "FAIL"
+        lines.append(
+            f"| {modality_labels.get(modality, modality)} | 예 | {result['samples_evaluated']} | {result['skipped_queries']} | "
+            f"{result['MRR']:.4f} | {result[f'NDCG@{metric_k}']:.4f} | {result[f'HitRate@{metric_k}']:.4f} | "
+            f"{result['avg_api_latency_ms']:.2f} | {result['p95_latency_ms']:.2f} | {result['avg_wall_latency_ms']:.2f} | "
+            f"{result['p95_wall_latency_ms']:.2f} | {status} |"
+        )
+    lines.append("")
+    lines.append("## 종합 결과")
+    lines.append("")
+    lines.append(f"- 종합 MRR: `{report['search']['MRR']:.4f}`")
+    lines.append(f"- 종합 NDCG@{metric_k}: `{report['search'][f'NDCG@{metric_k}']:.4f}`")
+    lines.append(f"- 종합 평균 API latency: `{report['search']['avg_latency_ms']:.2f} ms`")
+    lines.append(f"- 종합 P95 API latency: `{report['search']['p95_latency_ms']:.2f} ms`")
+    lines.append(f"- 종합 평균 Wall latency: `{report['search']['avg_wall_latency_ms']:.2f} ms`")
+    lines.append(f"- 종합 P95 Wall latency: `{report['search']['p95_wall_latency_ms']:.2f} ms`")
+    lines.append(f"- 전체 latency 기준 충족 여부: `{'PASS' if report['checks']['latency_within_threshold'] else 'FAIL'}`")
+    lines.append(f"- 전체 MRR 기준 충족 여부: `{'PASS' if report['checks']['mrr_meets_target'] else 'FAIL'}`")
+    lines.append(f"- 전체 NDCG 기준 충족 여부: `{'PASS' if report['checks']['ndcg_meets_target'] else 'FAIL'}`")
+    lines.append(f"- 모든 모달리티 측정 가능 여부: `{'YES' if report['checks']['all_modalities_available'] else 'NO'}`")
+    lines.append("")
+    lines.append("## 베이스라인 비교")
+    lines.append("")
+    lines.append("- 검색 베이스라인: `BM25 text-only`")
+    lines.append(f"- BM25 MRR: `{report['baseline']['text']['MRR']:.4f}`")
+    lines.append(f"- BM25 NDCG@{metric_k}: `{report['baseline']['text'][f'NDCG@{metric_k}']:.4f}`")
+    lines.append(f"- CLIP text MRR 개선폭: `{report['baseline']['text_improvement']['MRR_delta']:+.4f}`")
+    lines.append(f"- CLIP text NDCG@{metric_k} 개선폭: `{report['baseline']['text_improvement'][f'NDCG@{metric_k}_delta']:+.4f}`")
+    lines.append("")
+    lines.append("## 성능 개선 체크리스트")
+    lines.append("")
+    lines.append("| 항목 | 상태 | 비고 |")
+    lines.append("| --- | --- | --- |")
+    for entry in checklist:
+        lines.append(f"| {entry['name']} | {entry['status']} | {entry['notes']} |")
+    lines.append("")
+    lines.append("## 쿼리 미리보기")
+    lines.append("")
+    preview_cols = ["query_id", "query", "query_product_id", "relevant_count"]
+    if "source_split" in eval_df.columns:
+        preview_cols.append("source_split")
+    preview = eval_df.head(10)[preview_cols]
+    lines.append("| query_id | query | 대표 상품 id | relevant 수 | source |")
+    lines.append("| --- | --- | --- | ---: | --- |")
+    for row in preview.itertuples(index=False):
+        source = getattr(row, "source_split", "")
+        lines.append(
+            f"| {row.query_id} | {str(row.query).replace('|', '/')} | {row.query_product_id} | {row.relevant_count} | {source} |"
+        )
+    lines.append("")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate multimodal search quality report for the dashboard")
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
@@ -1085,16 +1546,20 @@ def main() -> None:
     parser.add_argument("--metric-k", type=int, default=DEFAULT_METRIC_K)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     parser.add_argument("--random-seed", type=int, default=DEFAULT_RANDOM_SEED)
+    parser.add_argument("--warmup-calls", type=int, default=DEFAULT_WARMUP_CALLS)
+    parser.add_argument("--measured-calls", type=int, default=DEFAULT_MEASURED_CALLS)
     parser.add_argument("--eval-set-output", default=str(SEARCH_EVAL_SET_PATH))
     parser.add_argument("--report-output", default=str(SEARCH_JSON_REPORT_PATH))
     parser.add_argument("--doc-output", default=str(SEARCH_DOC_REPORT_PATH))
     args = parser.parse_args()
 
-    resolved_mode, endpoint_health = _resolve_eval_mode(
+    resolved_mode, endpoint_health, resolved_endpoint = _resolve_eval_mode(
         requested_mode=args.mode,
         endpoint=args.endpoint,
         timeout=args.timeout,
     )
+    runtime_environment = _runtime_environment()
+    effective_latency_threshold_ms = _effective_latency_threshold_ms(runtime_environment)
 
     eval_df = build_eval_set(
         mode=resolved_mode,
@@ -1116,23 +1581,74 @@ def main() -> None:
     modalities = {
         modality: evaluate_modality(
             eval_df=eval_df,
-            endpoint=args.endpoint,
+            endpoint=resolved_endpoint,
             modality=modality,
             top_k=args.top_k,
             metric_k=args.metric_k,
             timeout=args.timeout,
             mode=resolved_mode,
+            warmup_calls=args.warmup_calls,
+            measured_calls=args.measured_calls,
+            latency_threshold_ms=effective_latency_threshold_ms,
         )
         for modality in ("text", "image", "hybrid")
     }
     overall_search, overall_checks = _overall_summary(modalities, args.metric_k)
     items_df = _load_index_items(resolved_mode)
     baseline_text = evaluate_bm25_baseline(eval_df=eval_df, items_df=items_df, metric_k=args.metric_k)
+    performance_checklist = [
+        {
+            "name": "10회 warm-up 후 100회 p95 측정",
+            "status": "applied",
+            "notes": "모달리티별 warm-up과 100회 wall latency 측정을 수행하고 p95를 합격 기준으로 사용",
+        },
+        {
+            "name": "Single request 기준 측정",
+            "status": "applied",
+            "notes": "동시 요청 부하 없이 단건 POST /search 호출만 측정",
+        },
+        {
+            "name": "Query-side cache 비활성화",
+            "status": "applied",
+            "notes": "평가 요청은 use_cache=false로 보내 첫 검색과 유사한 조건을 유지",
+        },
+        {
+            "name": "검색 인덱스/임베딩 아티팩트 재사용",
+            "status": "applied",
+            "notes": "search_engine의 저장된 index/metadata/aux 벡터가 있으면 재사용하고, 없을 때만 한 번 생성",
+        },
+        {
+            "name": "서버 startup warm-up",
+            "status": "applied",
+            "notes": "search_engine/app.py에서 text, image, hybrid 경로를 미리 warm-up",
+        },
+        {
+            "name": "FAISS HNSW 인덱스 사용",
+            "status": "applied",
+            "notes": "현재 검색 인덱스는 IndexHNSWFlat 기반이며 IVF nprobe는 적용 대상이 아님",
+        },
+        {
+            "name": "이미지 검색 재랭킹",
+            "status": "applied",
+            "notes": "최근접 visual anchor의 메타데이터 힌트를 사용해 image-only 품질을 보강",
+        },
+        {
+            "name": "ONNX 변환",
+            "status": "not_attempted",
+            "notes": "현재 코드베이스에는 ONNX export/inference 경로를 추가하지 않음",
+        },
+        {
+            "name": "양자화",
+            "status": "not_attempted",
+            "notes": "현재 CLIP 추론은 원본 가중치 그대로 사용",
+        },
+    ]
 
     report = {
         "metadata": {
             "generated_at": pd.Timestamp.now("UTC").isoformat(),
-            "endpoint": args.endpoint,
+            "endpoint": resolved_endpoint,
+            "requested_endpoint": args.endpoint,
             "mode": resolved_mode,
             "top_k": args.top_k,
             "metric_k": args.metric_k,
@@ -1142,16 +1658,29 @@ def main() -> None:
             "endpoint_health": endpoint_health,
             "eval_source_counts": eval_df["source_split"].value_counts().to_dict() if "source_split" in eval_df.columns else {},
             "query_cache_mode": "disabled_during_evaluation",
+            "runtime_environment": runtime_environment,
+            "measurement_protocol": {
+                "warmup_calls": int(args.warmup_calls),
+                "measured_calls": int(args.measured_calls),
+                "latency_target_ms": LATENCY_TARGET_MS,
+                "cpu_only_tolerance_ms": CPU_ONLY_TOLERANCE_MS,
+                "effective_latency_threshold_ms": effective_latency_threshold_ms,
+                "latency_judged_on": "p95_wall_latency_ms",
+                "single_request_only": True,
+            },
         },
         "split_summary": _load_split_summary(resolved_mode),
         "thresholds": {
-            "latency_ms_max": 200.0,
+            "latency_p95_wall_ms_max": effective_latency_threshold_ms,
+            "latency_target_ms": LATENCY_TARGET_MS,
+            "cpu_only_tolerance_ms": CPU_ONLY_TOLERANCE_MS,
             "mrr_min": 0.55,
             "ndcg_at_10_min": 0.50,
         },
         "search": overall_search,
         "checks": overall_checks,
         "modalities": modalities,
+        "performance_checklist": performance_checklist,
         "baseline": {
             "name": "BM25 text-only",
             "text": baseline_text,
@@ -1164,7 +1693,7 @@ def main() -> None:
 
     report_output.parent.mkdir(parents=True, exist_ok=True)
     report_output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_search_markdown_report_v2(report=report, output_path=doc_output, eval_df=eval_df)
+    write_search_markdown_report_v4(report=report, output_path=doc_output, eval_df=eval_df)
 
     print("===== Search Metrics Report =====")
     print(f"Eval set           : {eval_output}")
@@ -1174,21 +1703,25 @@ def main() -> None:
     print(
         f"[overall] MRR={overall_search['MRR']:.4f} "
         f"NDCG@{args.metric_k}={overall_search[f'NDCG@{args.metric_k}']:.4f} "
-        f"AvgLatency={overall_search['avg_latency_ms']:.2f}ms"
+        f"P95WallLatency={overall_search['p95_wall_latency_ms']:.2f}ms"
     )
     for modality, result in modalities.items():
+        if not result.get("available", True):
+            print(f"[{modality}] UNAVAILABLE: {result.get('unavailable_reason', 'unknown')}")
+            continue
         print(
             f"[{modality}] MRR={result['MRR']:.4f} "
             f"NDCG@{args.metric_k}={result[f'NDCG@{args.metric_k}']:.4f} "
-            f"AvgLatency={result['avg_latency_ms']:.2f}ms"
+            f"P95WallLatency={result['p95_wall_latency_ms']:.2f}ms"
         )
     print(
         f"[baseline:text] MRR={baseline_text['MRR']:.4f} "
         f"NDCG@{args.metric_k}={baseline_text[f'NDCG@{args.metric_k}']:.4f}"
     )
-    print(f"All latency <= 200ms : {'PASS' if overall_checks['latency_within_200ms'] else 'FAIL'}")
+    print(f"Latency p95 within threshold : {'PASS' if overall_checks['latency_within_threshold'] else 'FAIL'}")
     print(f"All MRR >= 0.55      : {'PASS' if overall_checks['mrr_meets_target'] else 'FAIL'}")
     print(f"All NDCG >= 0.50     : {'PASS' if overall_checks['ndcg_meets_target'] else 'FAIL'}")
+    print(f"All modalities available : {'YES' if overall_checks['all_modalities_available'] else 'NO'}")
 
 
 if __name__ == "__main__":

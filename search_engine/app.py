@@ -153,22 +153,13 @@ def _artifacts_match(meta_path: Path, mode: str) -> bool:
 def _build_or_load_engine(mode: str) -> MultimodalSearchEngine:
     data_root = _configured_data_root()
     index_path, meta_path = _artifact_paths(mode)
-
-    if index_path.exists() and meta_path.exists() and _artifacts_match(meta_path, mode):
-        LOGGER.info("Loading cached %s search index from %s", mode, index_path)
-        return MultimodalSearchEngine.load_from_artifacts(
-            str(index_path),
-            str(meta_path),
-            mode=mode,
-            data_root=data_root,
-        )
-
-    LOGGER.info("Building fresh %s multimodal search index", mode)
-    engine = MultimodalSearchEngine(mode=mode, data_root=data_root)
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    engine.save_index(str(index_path), str(meta_path))
-    LOGGER.info("Saved %s multimodal search index to %s", mode, index_path)
-    return engine
+    if index_path.exists() and meta_path.exists() and not _artifacts_match(meta_path, mode):
+        LOGGER.warning("Cached %s artifacts at %s do not match expected format. Rebuilding.", mode, index_path)
+    return MultimodalSearchEngine.load_cached_or_build(
+        mode=mode,
+        data_root=data_root,
+        cache_dir=index_path.parent,
+    )
 
 
 def image_url_for_article(article_id: str) -> str:

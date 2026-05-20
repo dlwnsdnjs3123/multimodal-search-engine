@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import json
 import hashlib
@@ -26,6 +27,8 @@ from query_expansion import expand_fashion_query
 LOGGER = logging.getLogger(__name__)
 
 os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 CLIP_MODEL_NAME = os.getenv("CLIP_MODEL_NAME", "openai/clip-vit-base-patch32")
 DEFAULT_TOP_K = 10
@@ -34,6 +37,11 @@ DEFAULT_RANDOM_SEED = 42
 DEFAULT_DEV_SAMPLE_SIZE = 600
 SEARCH_PAIR_MANIFEST_DEV = "search_pairs_dev.csv"
 SEARCH_PAIR_MANIFEST_PROD = "search_pairs_production.csv"
+SEARCH_INDEX_FILENAMES = {
+    "test": ("search_test_v2.index", "search_test_v2_metadata.json"),
+    "dev": ("search_dev_v2.index", "search_dev_v2_metadata.json"),
+    "production": ("search_v2.index", "search_v2_metadata.json"),
+}
 CSV_STRING_COLUMNS = {
     "article_id": str,
     "product_code": str,
@@ -153,8 +161,9 @@ class OpenAIClipEmbedder:
             last_error: Optional[Exception] = None
             for kwargs in load_attempts:
                 try:
-                    self.processor = CLIPProcessor.from_pretrained(self.model_name, **kwargs)
-                    self.model = CLIPModel.from_pretrained(self.model_name, **kwargs)
+                    with self._suppress_model_load_output():
+                        self.processor = CLIPProcessor.from_pretrained(self.model_name, **kwargs)
+                        self.model = CLIPModel.from_pretrained(self.model_name, **kwargs)
                     break
                 except Exception as exc:
                     last_error = exc
@@ -180,6 +189,30 @@ class OpenAIClipEmbedder:
             LOGGER.exception(message)
             if self.fail_on_load_error:
                 raise RuntimeError(message) from exc
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _suppress_model_load_output():
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+        try:
+            from transformers.utils import logging as transformers_logging
+
+            previous_level = transformers_logging.get_verbosity()
+            transformers_logging.set_verbosity_error()
+        except Exception:
+            transformers_logging = None
+            previous_level = None
+
+        try:
+            with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+                yield
+        finally:
+            if transformers_logging is not None and previous_level is not None:
+                try:
+                    transformers_logging.set_verbosity(previous_level)
+                except Exception:
+                    pass
 
     def _require_components(self) -> Tuple[CLIPModel, CLIPProcessor, int]:
         self._ensure_loaded()
@@ -394,13 +427,19 @@ class MultimodalSearchEngine:
     @staticmethod
     def _resolve_data_root(data_root: Optional[str]) -> Path:
         if data_root:
-            return Path(data_root)
+            path = Path(data_root)
+            if (path / "processed" / "item_master_dev.csv").exists() or (path / "processed" / "articles_feature.csv").exists():
+                return path / "processed"
+            return path
 
         file_dir = Path(__file__).resolve().parent
         project_root = file_dir.parent
         # docker-compose와 로컬 실행을 모두 지원하기 위해 후보 경로를 순서대로 확인한다.
         candidates = [
+            os.getenv("SEARCH_ENGINE_DATA_ROOT"),
             os.getenv("DATA_ROOT"),
+            file_dir / "data" / "processed",
+            project_root / "data" / "processed",
             file_dir / "data",
             project_root / "data",
             Path("/app/data"),
@@ -411,28 +450,28 @@ class MultimodalSearchEngine:
             if not candidate:
                 continue
             path = Path(candidate)
-            if (path / "articles.csv").exists():
+            if (path / "item_master_dev.csv").exists() or (path / "articles_feature.csv").exists() or (path / "item_master.csv").exists():
                 return path
 
         for candidate in candidates:
             if candidate:
                 return Path(candidate)
-        return project_root / "data"
+        return project_root / "data" / "processed"
 
     @staticmethod
     def _resolve_runtime_data_root(data_root: Optional[str]) -> Path:
         if data_root:
             path = Path(data_root)
-            if (path / "articles.csv").exists():
-                return path
             if (path / "articles_feature.csv").exists():
                 return path
             if (path / "item_master_dev.csv").exists():
                 return path
             if (path / "item_master.csv").exists():
                 return path
-            if (path / "raw" / "articles.csv").exists():
-                return path / "raw"
+            if (path / "processed" / "articles_feature.csv").exists():
+                return path / "processed"
+            if (path / "processed" / "item_master_dev.csv").exists():
+                return path / "processed"
             return path
 
         env_root = os.getenv("SEARCH_ENGINE_DATA_ROOT") or os.getenv("DATA_ROOT")
@@ -440,30 +479,29 @@ class MultimodalSearchEngine:
         project_root = file_dir.parent
         candidates = [
             Path(env_root) if env_root else None,
+            file_dir / "data" / "processed",
+            project_root / "data" / "processed",
             file_dir / "data",
             project_root / "data",
             Path("/app/data"),
+            Path("/app/data/processed"),
         ]
 
         for candidate in candidates:
             if not candidate:
                 continue
             path = Path(candidate)
-            if (path / "articles.csv").exists():
-                return path
             if (path / "articles_feature.csv").exists():
                 return path
             if (path / "item_master_dev.csv").exists():
                 return path
             if (path / "item_master.csv").exists():
                 return path
-            if (path / "raw" / "articles.csv").exists():
-                return path / "raw"
 
         for candidate in candidates:
             if candidate and Path(candidate).exists():
                 return Path(candidate)
-        return project_root / "data"
+        return project_root / "data" / "processed"
 
     def _build_dummy_items(self) -> List[SearchItem]:
         # test 모드에서는 더미 이미지와 설명을 직접 만들어 즉시 검색 가능 상태로 만든다.
@@ -538,27 +576,19 @@ class MultimodalSearchEngine:
                 self.data_root / "item_master_dev.csv",
             ]
         else:
-            preferred = [self.data_root / "articles.csv"]
-        fallback = [
-            self.data_root / "articles.csv",
-            self.data_root / "raw" / "articles.csv",
-            self.data_root.parent / "raw" / "articles.csv",
-        ]
-        return preferred + fallback
-
-    def _raw_article_candidates(self) -> List[Path]:
-        return [
-            self.data_root / "articles.csv",
-            self.data_root / "raw" / "articles.csv",
-            self.data_root.parent / "raw" / "articles.csv",
-        ]
+            preferred = [self.data_root / "item_master_dev.csv", self.data_root / "articles_feature.csv"]
+        return preferred
 
     def _feature_article_candidates(self, mode_label: str) -> List[Path]:
         base_candidates = [
             self.data_root / "articles_feature.csv",
+            self.data_root / "item_features_dev.csv",
+            self.data_root / "item_features.csv",
             self.data_root / "item_master_dev.csv",
             self.data_root / "item_master.csv",
             self.data_root.parent / "processed" / "articles_feature.csv",
+            self.data_root.parent / "processed" / "item_features_dev.csv",
+            self.data_root.parent / "processed" / "item_features.csv",
             self.data_root.parent / "processed" / "item_master_dev.csv",
             self.data_root.parent / "processed" / "item_master.csv",
         ]
@@ -614,18 +644,10 @@ class MultimodalSearchEngine:
                     return frame, path
             except Exception as exc:
                 LOGGER.warning("Failed to load article table from %s: %s", path, exc)
-        for path in self._raw_article_candidates():
-            if not path.exists():
-                continue
-            try:
-                raw_articles = pd.read_csv(path, dtype=CSV_STRING_COLUMNS).fillna("")
-            except Exception as exc:
-                LOGGER.warning("Failed to load raw article table from %s: %s", path, exc)
-                continue
-            if raw_articles.empty:
-                continue
-            return self._merge_article_features(raw_articles, mode_label), path
-        raise FileNotFoundError(f"No article table found for mode={mode_label} under {self.data_root}")
+        raise FileNotFoundError(
+            f"No processed article table found for mode={mode_label} under {self.data_root}. "
+            "Expected item_master_dev.csv, item_master.csv, or articles_feature.csv."
+        )
 
     @staticmethod
     def _normalize_article_id(value: Any) -> str:
@@ -806,9 +828,6 @@ class MultimodalSearchEngine:
             self.data_root / "item_features.csv",
             self.data_root / "item_master_dev.csv",
             self.data_root / "item_master.csv",
-            self.data_root / "transactions_train.csv",
-            self.data_root / "processed" / "transactions_train.csv",
-            self.data_root / "train_data.csv",
         ]
         for path in candidates:
             if not path.exists():
@@ -1552,6 +1571,47 @@ class MultimodalSearchEngine:
             obj._image_item_indices = np.arange(len(obj.items), dtype=np.int64)
         return obj
 
+    @classmethod
+    def artifact_paths_for_mode(
+        cls,
+        mode: str,
+        data_root: Optional[str] = None,
+        cache_dir: Optional[str | Path] = None,
+    ) -> tuple[Path, Path]:
+        resolved_root = cls._resolve_runtime_data_root(data_root)
+        cache_root = Path(cache_dir) if cache_dir is not None else resolved_root.parent / "faiss_index"
+        index_name, meta_name = SEARCH_INDEX_FILENAMES.get(mode, SEARCH_INDEX_FILENAMES["production"])
+        return cache_root / index_name, cache_root / meta_name
+
+    @classmethod
+    def load_cached_or_build(
+        cls,
+        mode: str = "production",
+        data_root: Optional[str] = None,
+        cache_dir: Optional[str | Path] = None,
+        clip_model_name: str = CLIP_MODEL_NAME,
+    ) -> "MultimodalSearchEngine":
+        index_path, meta_path = cls.artifact_paths_for_mode(mode=mode, data_root=data_root, cache_dir=cache_dir)
+        if index_path.exists() and meta_path.exists():
+            try:
+                LOGGER.info("Loading cached %s search artifacts from %s", mode, index_path)
+                return cls.load_from_artifacts(
+                    str(index_path),
+                    str(meta_path),
+                    mode=mode,
+                    data_root=data_root,
+                    clip_model_name=clip_model_name,
+                )
+            except Exception as exc:
+                LOGGER.warning("Failed to load cached %s artifacts from %s: %s", mode, index_path, exc)
+
+        LOGGER.info("No reusable %s search artifacts were found. Building index once and saving cache.", mode)
+        engine = cls(mode=mode, data_root=data_root, clip_model_name=clip_model_name)
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        engine.save_index(str(index_path), str(meta_path))
+        LOGGER.info("Saved %s search artifacts to %s", mode, index_path)
+        return engine
+
     def find_item(self, product_id: str) -> Optional[SearchItem]:
         needle = normalize_article_id(product_id)
         for item in self.items:
@@ -1578,7 +1638,8 @@ if __name__ == "__main__":
     _configure_logging()
     selected_mode = os.getenv("MODE", "test")
     LOGGER.info("Starting standalone search engine in %s mode", selected_mode)
-    engine = MultimodalSearchEngine(mode=selected_mode)
+    configured_data_root = os.getenv("SEARCH_ENGINE_DATA_ROOT") or os.getenv("DATA_ROOT")
+    engine = MultimodalSearchEngine.load_cached_or_build(mode=selected_mode, data_root=configured_data_root)
     print(f"[search_engine] mode={selected_mode}")
     print(f"[search_engine] data_root={engine.data_root}")
     print(f"[search_engine] items={len(engine.items)}")

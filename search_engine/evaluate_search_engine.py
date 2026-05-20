@@ -4,6 +4,7 @@ import argparse
 import base64
 import csv
 import json
+import math
 import sys
 import time
 import urllib.error
@@ -11,6 +12,11 @@ import urllib.request
 from pathlib import Path
 from statistics import mean
 from typing import Any, Sequence
+
+DEFAULT_WARMUP_CALLS = 10
+DEFAULT_MEASURED_CALLS = 100
+LATENCY_TARGET_MS = 200.0
+CPU_ONLY_TOLERANCE_MS = 50.0
 
 # Make repo root importable when this file lives in search_engine/
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -103,6 +109,14 @@ def _call_search_api(
         raise RuntimeError(f"Failed to connect to {endpoint}: {e}") from e
 
 
+def _p95(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    rank = max(0, math.ceil(0.95 * len(ordered)) - 1)
+    return float(ordered[rank])
+
+
 def load_eval_rows(csv_path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
@@ -131,6 +145,8 @@ def evaluate(
     top_k: int = 10,
     metric_k: int = 10,
     timeout: float = 60.0,
+    warmup_calls: int = DEFAULT_WARMUP_CALLS,
+    measured_calls: int = DEFAULT_MEASURED_CALLS,
 ) -> None:
     rows = load_eval_rows(input_csv)
     if not rows:
@@ -138,10 +154,8 @@ def evaluate(
 
     ranked_lists: list[list[str]] = []
     relevant_lists: list[list[str]] = []
-    api_latencies: list[float] = []
-    wall_latencies: list[float] = []
-
     base_dir = input_csv.parent
+    prepared_rows: list[dict[str, Any]] = []
 
     for idx, row in enumerate(rows, start=1):
         query = row["query"].strip()
@@ -155,11 +169,36 @@ def evaluate(
         if image_b64 is None and row["image_path"]:
             image_b64 = _image_to_base64(row["image_path"], base_dir)
 
+        prepared_rows.append(
+            {
+                "query": query,
+                "relevant_items": [str(x).strip() for x in relevant_items if str(x).strip()],
+                "image_base64": image_b64,
+            }
+        )
+
+    if not prepared_rows:
+        raise ValueError("No valid evaluation samples were prepared.")
+
+    for idx in range(max(0, int(warmup_calls))):
+        sample = prepared_rows[idx % len(prepared_rows)]
+        _call_search_api(
+            endpoint=endpoint,
+            query=sample["query"],
+            image_base64=sample["image_base64"],
+            top_k=top_k,
+            timeout=timeout,
+        )
+
+    api_latencies: list[float] = []
+    wall_latencies: list[float] = []
+
+    for sample in prepared_rows:
         started = time.perf_counter()
         response = _call_search_api(
             endpoint=endpoint,
-            query=query,
-            image_base64=image_b64,
+            query=sample["query"],
+            image_base64=sample["image_base64"],
             top_k=top_k,
             timeout=timeout,
         )
@@ -169,13 +208,24 @@ def evaluate(
         ranked_items = [str(item.get("product_id", "")).strip() for item in results if str(item.get("product_id", "")).strip()]
 
         ranked_lists.append(ranked_items)
-        relevant_lists.append([str(x).strip() for x in relevant_items if str(x).strip()])
-
-        api_latencies.append(float(response.get("latency_ms", wall_ms)))
-        wall_latencies.append(wall_ms)
+        relevant_lists.append(sample["relevant_items"])
 
     if not ranked_lists:
         raise ValueError("No valid evaluation samples were processed.")
+
+    for idx in range(max(1, int(measured_calls))):
+        sample = prepared_rows[idx % len(prepared_rows)]
+        started = time.perf_counter()
+        response = _call_search_api(
+            endpoint=endpoint,
+            query=sample["query"],
+            image_base64=sample["image_base64"],
+            top_k=top_k,
+            timeout=timeout,
+        )
+        wall_ms = (time.perf_counter() - started) * 1000.0
+        api_latencies.append(float(response.get("latency_ms", wall_ms)))
+        wall_latencies.append(wall_ms)
 
     hitrate = mean_hit_rate_at_k(ranked_lists, relevant_lists, metric_k)
     mrr = mean_reciprocal_rank(ranked_lists, relevant_lists)
@@ -183,19 +233,26 @@ def evaluate(
 
     avg_api_latency = mean(api_latencies)
     avg_wall_latency = mean(wall_latencies)
+    p95_api_latency = _p95(api_latencies)
+    p95_wall_latency = _p95(wall_latencies)
+    latency_threshold_ms = LATENCY_TARGET_MS + CPU_ONLY_TOLERANCE_MS
 
     print("===== Search Engine Evaluation =====")
     print(f"Samples evaluated : {len(ranked_lists)}")
     print(f"Top-K requested    : {top_k}")
     print(f"Metric K          : {metric_k}")
+    print(f"Warm-up calls     : {warmup_calls}")
+    print(f"Measured calls    : {measured_calls}")
     print(f"HitRate@{metric_k}     : {hitrate:.6f}")
     print(f"MRR               : {mrr:.6f}")
     print(f"NDCG@{metric_k}        : {ndcg:.6f}")
     print(f"Avg API latency   : {avg_api_latency:.2f} ms")
+    print(f"P95 API latency   : {p95_api_latency:.2f} ms")
     print(f"Avg wall latency  : {avg_wall_latency:.2f} ms")
+    print(f"P95 wall latency  : {p95_wall_latency:.2f} ms")
     print()
     print("===== Target Check =====")
-    print(f"Latency <= 200ms  : {'PASS' if avg_wall_latency <= 200.0 else 'FAIL'}")
+    print(f"Latency p95 <= {latency_threshold_ms:.0f}ms : {'PASS' if p95_wall_latency <= latency_threshold_ms else 'FAIL'}")
     print(f"MRR >= 0.55       : {'PASS' if mrr >= 0.55 else 'FAIL'}")
     print(f"NDCG@10 >= 0.50   : {'PASS' if ndcg >= 0.50 else 'FAIL'}")
 
@@ -209,12 +266,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--endpoint",
-        default="http://localhost:8002/search",
-        help="Search API endpoint (default: http://localhost:8002/search)",
+        default="http://127.0.0.1:8002/search",
+        help="Search API endpoint (default: http://127.0.0.1:8002/search)",
     )
     parser.add_argument("--top-k", type=int, default=10, help="Top-K passed to the search API")
     parser.add_argument("--metric-k", type=int, default=10, help="K used for HitRate@K / NDCG@K")
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds")
+    parser.add_argument("--warmup-calls", type=int, default=DEFAULT_WARMUP_CALLS, help="Warm-up calls before timing")
+    parser.add_argument("--measured-calls", type=int, default=DEFAULT_MEASURED_CALLS, help="Number of timed calls for p95 latency")
     args = parser.parse_args()
 
     evaluate(
@@ -223,6 +282,8 @@ def main() -> None:
         top_k=args.top_k,
         metric_k=args.metric_k,
         timeout=args.timeout,
+        warmup_calls=args.warmup_calls,
+        measured_calls=args.measured_calls,
     )
 
 
