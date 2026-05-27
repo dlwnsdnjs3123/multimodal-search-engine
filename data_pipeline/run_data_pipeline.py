@@ -8,6 +8,10 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
+try:
+    from data_pipeline.pipeline_config import DEFAULT_MODE, select_mode_config
+except ImportError:  # pragma: no cover - supports direct script execution
+    from pipeline_config import DEFAULT_MODE, select_mode_config
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_PIPELINE_DIR = BASE_DIR / "data_pipeline"
@@ -19,9 +23,7 @@ REQUIRED_RAW_FILES = [
     RAW_DIR / "transactions_train.csv",
 ]
 
-# MODE = "production"
-# MODE = "dev"
-MODE = "test"
+MODE = DEFAULT_MODE
 
 MODE_CONFIG = {
     "test": {
@@ -35,12 +37,7 @@ MODE_CONFIG = {
     },
 }
 
-RUNTIME_MODE = os.getenv("DATA_PIPELINE_MODE", MODE).strip().lower()
-
-if RUNTIME_MODE not in MODE_CONFIG:
-    raise ValueError(f"Unsupported MODE: {RUNTIME_MODE}")
-
-CONFIG = MODE_CONFIG[RUNTIME_MODE]
+RUNTIME_MODE, CONFIG = select_mode_config(MODE_CONFIG, default_mode=MODE)
 OUTPUT_DIR: Path = CONFIG["OUTPUT_DIR"]
 
 PIPELINE_STEPS = [

@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 
 try:
+    from rec_models.common.personas import PERSONA_SESSION_INTERESTS
     from rec_models.serving.bandit_store import get_bandit_store
     from rec_models.serving.candidate_service import (
         generate_candidates,
@@ -28,6 +29,7 @@ try:
     )
     from rec_models.serving.rerank_bridge import rerank_recommendations
 except ImportError:  # pragma: no cover - supports running from rec_models/ as cwd
+    from common.personas import PERSONA_SESSION_INTERESTS  # type: ignore[no-redef]
     from serving.bandit_store import get_bandit_store  # type: ignore[no-redef]
     from serving.candidate_service import (  # type: ignore[no-redef]
         generate_candidates,
@@ -49,18 +51,6 @@ except ImportError:  # pragma: no cover - supports running from rec_models/ as c
 
 
 LOGGER = logging.getLogger(__name__)
-
-PERSONA_SESSION_INTERESTS: dict[str, dict[str, float]] = {
-    "trendsetter": {"Ladieswear": 8.0, "Menswear": 8.0, "Sport": 6.0},
-    "practical": {"Menswear": 9.0, "Ladieswear": 7.0},
-    "value": {"Divided": 9.0, "Ladieswear": 6.0, "Menswear": 6.0},
-    "brand_loyal": {"Ladieswear": 9.0, "Menswear": 7.0, "Lingeries/Tights": 8.0},
-    "impulse": {"Ladieswear": 8.0, "Menswear": 7.0, "Kids": 5.0},
-    "careful": {"Menswear": 7.0, "Ladieswear": 7.0, "Sport": 6.0},
-    "repeat_stable": {"Ladieswear": 9.0, "Menswear": 9.0},
-    "color_focus": {"Ladieswear": 9.0, "Divided": 7.0},
-    "category_focus": {"Ladieswear": 10.0, "Menswear": 8.0},
-}
 
 PERSONA_RERANK_PROFILES: dict[str, dict[str, float]] = {
     # Newness and controlled exploration matter more for users who actively

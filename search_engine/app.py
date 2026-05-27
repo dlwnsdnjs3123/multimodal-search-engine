@@ -22,7 +22,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from search_engine import MultimodalSearchEngine
 
@@ -184,6 +184,11 @@ class SearchRequest(BaseModel):
     use_cache: bool = True
 
 
+class CrossSimilarityRequest(BaseModel):
+    article_ids: list[str | int] = Field(default_factory=list)
+    modality: str = "multimodal"
+
+
 def _base64_payload_from_item(item: Any) -> tuple[str, str]:
     image_base64 = str(getattr(item, "metadata", {}).get("_image_base64", "")).strip()
     if image_base64:
@@ -275,6 +280,32 @@ async def search(req: SearchRequest) -> dict[str, Any]:
             result.setdefault("color", "")
             result.setdefault("product_type", "")
     return response
+
+
+@app.post("/cross-similarity")
+@app.post("/api/cross-similarity")
+async def cross_similarity(req: CrossSimilarityRequest) -> dict[str, Any]:
+    if not req.article_ids:
+        raise HTTPException(status_code=400, detail="article_ids must not be empty")
+    if len(req.article_ids) > 200:
+        raise HTTPException(status_code=400, detail="article_ids can contain at most 200 items")
+
+    try:
+        article_ids, missing_article_ids, similarity = search_engine.cross_similarity(
+            req.article_ids,
+            modality=req.modality,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return {
+        "article_ids": article_ids,
+        "missing_article_ids": missing_article_ids,
+        "modality": req.modality,
+        "similarity": similarity,
+    }
 
 
 @app.get("/api/images/{article_id}")

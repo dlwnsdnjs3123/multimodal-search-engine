@@ -7,14 +7,19 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Sequence
 
-from config_loader import load_yaml_config
+try:
+    from data_pipeline.config_loader import load_yaml_config
+except ImportError:  # pragma: no cover - supports direct script execution
+    from config_loader import load_yaml_config
+try:
+    from data_pipeline.pipeline_config import DEFAULT_MODE, select_mode_config
+except ImportError:  # pragma: no cover - supports direct script execution
+    from pipeline_config import DEFAULT_MODE, select_mode_config
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_FILE = BASE_DIR / "simulator" / "persona_config_9.yaml"
 
-# MODE = "production"
-# MODE = "dev"
-MODE = "test"
+MODE = DEFAULT_MODE
 
 MODE_CONFIG = {
     "test": {
@@ -49,12 +54,7 @@ MODE_CONFIG = {
     },
 }
 
-RUNTIME_MODE = os.getenv("DATA_PIPELINE_MODE", MODE).strip().lower()
-
-if RUNTIME_MODE not in MODE_CONFIG:
-    raise ValueError(f"Unsupported MODE: {RUNTIME_MODE}")
-
-CONFIG = MODE_CONFIG[RUNTIME_MODE]
+RUNTIME_MODE, CONFIG = select_mode_config(MODE_CONFIG, default_mode=MODE)
 SIM_USERS_FILE: Path = CONFIG["SIM_USERS_FILE"]
 ITEM_MASTER_FILE: Path = CONFIG["ITEM_MASTER_FILE"]
 ITEM_PERSONA_FILE: Path = CONFIG["ITEM_PERSONA_FILE"]

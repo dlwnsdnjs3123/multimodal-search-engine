@@ -45,9 +45,9 @@
 ┌─────────────────────┐     ┌──────────────────┐
 │  Dashboard :8501    │     │  Simulator       │
 │  Streamlit          │     │  행동 로그 생성   │
-│  - 검색 품질 지표   │     │  (구현 예정)     │
-│  - 추천 성능 지표   │     └──────────────────┘
-│  - A/B 테스트 결과  │
+│  - 검색 품질 지표   │     │  - search/view   │
+│  - 추천 성능 지표   │     │  - cart/purchase │
+│  - A/B 테스트 결과  │     └──────────────────┘
 └─────────────────────┘
 ```
 
@@ -79,11 +79,10 @@ docker-compose up
 ### 데이터 파이프라인 실행 (최초 1회)
 
 ```bash
-python data_pipeline/build_article_features.py
-python data_pipeline/build_customer_features.py
-python data_pipeline/build_item_features.py
-python data_pipeline/build_ranking_train_data.py
+DATA_PIPELINE_MODE=test python data_pipeline/run_data_pipeline.py
 ```
+
+`DATA_PIPELINE_MODE`는 `test`, `dev`, `production`을 지원합니다.
 
 ---
 

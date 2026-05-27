@@ -22,7 +22,11 @@ import pandas as pd
 import torch
 from PIL import Image, ImageDraw
 from transformers import CLIPModel, CLIPProcessor
-from query_expansion import expand_fashion_query
+
+try:
+    from query_expansion import expand_fashion_query
+except ImportError:  # pragma: no cover - supports package-style imports in tests
+    from search_engine.query_expansion import expand_fashion_query  # type: ignore[no-redef]
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1158,6 +1162,79 @@ class MultimodalSearchEngine:
                 )
             )
         return hits
+
+    def _embedding_matrix_for_modality(self, modality: str) -> np.ndarray:
+        normalized_modality = (modality or "multimodal").strip().lower()
+        if normalized_modality in {"multimodal", "combined", "hybrid"}:
+            matrix = self._embeddings
+        elif normalized_modality == "text":
+            matrix = self._text_embeddings
+        elif normalized_modality == "image":
+            matrix = self._image_embeddings
+        else:
+            raise ValueError("modality must be one of: multimodal, text, image")
+
+        if matrix is None or matrix.size == 0:
+            raise RuntimeError(f"{normalized_modality} embeddings are not initialized")
+        if matrix.shape[0] != len(self.items):
+            raise RuntimeError(
+                f"{normalized_modality} embeddings do not match item count: "
+                f"{matrix.shape[0]} != {len(self.items)}"
+            )
+        return matrix
+
+    def _item_index_by_article_id(self) -> Dict[str, int]:
+        lookup: Dict[str, int] = {}
+        for index, item in enumerate(self.items):
+            lookup[normalize_article_id(item.product_id)] = index
+            if index < len(self.item_ids):
+                lookup[normalize_article_id(self.item_ids[index])] = index
+        return lookup
+
+    def cross_similarity(
+        self,
+        article_ids: Sequence[Any],
+        *,
+        modality: str = "multimodal",
+    ) -> tuple[list[str], list[str], dict[str, dict[str, float]]]:
+        """Return pairwise cosine similarity for known catalog article ids."""
+
+        requested_ids: list[str] = []
+        seen: set[str] = set()
+        for raw_article_id in article_ids:
+            article_id = normalize_article_id(raw_article_id)
+            if not article_id or article_id in seen:
+                continue
+            seen.add(article_id)
+            requested_ids.append(article_id)
+
+        matrix = self._embedding_matrix_for_modality(modality)
+        index_by_id = self._item_index_by_article_id()
+        found_ids: list[str] = []
+        found_indices: list[int] = []
+        missing_ids: list[str] = []
+        for article_id in requested_ids:
+            item_index = index_by_id.get(article_id)
+            if item_index is None:
+                missing_ids.append(article_id)
+                continue
+            found_ids.append(article_id)
+            found_indices.append(item_index)
+
+        if not found_indices:
+            return found_ids, missing_ids, {}
+
+        vectors = np.asarray(matrix[found_indices], dtype=np.float32).copy()
+        self._normalize_matrix_inplace(vectors)
+        scores = np.clip(vectors @ vectors.T, -1.0, 1.0)
+        similarity: dict[str, dict[str, float]] = {}
+        for row_index, source_id in enumerate(found_ids):
+            similarity[source_id] = {}
+            for column_index, target_id in enumerate(found_ids):
+                if source_id == target_id:
+                    continue
+                similarity[source_id][target_id] = round(float(scores[row_index, column_index]), 6)
+        return found_ids, missing_ids, similarity
 
     def _resolve_image_query_anchor(self, image_vec: np.ndarray, image_bytes: Optional[bytes]) -> Tuple[Optional[int], np.ndarray, bool]:
         image_scores = self._score_matrix(self._image_embeddings, image_vec)

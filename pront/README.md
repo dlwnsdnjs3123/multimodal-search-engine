@@ -1,7 +1,9 @@
-# pront
+# Frontend (`pront`)
 
 `pront`는 멀티모달 검색 엔진 프로젝트의 프론트엔드 UI입니다.  
 React, TypeScript, Vite 기반으로 구성되어 있으며, 현재는 `api_gateway`를 통해 백엔드와 연결되도록 맞춰져 있습니다.
+
+> 폴더명은 기존 Docker Compose 설정과 팀 작업 히스토리를 유지하기 위해 `pront`로 둡니다.
 
 ## 사용 기술
 
@@ -28,7 +30,7 @@ npm run dev
 
 - API Gateway: `http://localhost:8000`
 
-개발 환경에서는 [vite.config.ts](C:\Users\손석범\Documents\GitHub\multimodal-search-engine\pront\vite.config.ts) 에서 `/api` 요청을 `http://localhost:8000` 으로 프록시합니다.
+개발 환경에서는 `vite.config.ts`에서 `/api` 요청을 `http://localhost:8000`으로 프록시합니다.
 
 즉, 프론트에서는 아래 경로를 그대로 호출하면 됩니다.
 
@@ -46,9 +48,9 @@ VITE_API_BASE_URL=http://localhost:8000
 
 ## 주요 파일
 
-- [src/App.tsx](C:\Users\손석범\Documents\GitHub\multimodal-search-engine\pront\src\App.tsx): 메인 UI
-- [src/api.ts](C:\Users\손석범\Documents\GitHub\multimodal-search-engine\pront\src\api.ts): API 호출 및 응답 정규화
-- [vite.config.ts](C:\Users\손석범\Documents\GitHub\multimodal-search-engine\pront\vite.config.ts): Vite 설정 및 개발 프록시
+- `src/App.tsx`: 메인 UI
+- `src/api.ts`: API 호출 및 응답 정규화
+- `vite.config.ts`: Vite 설정 및 개발 프록시
 
 ## 주요 기능
 
@@ -61,4 +63,4 @@ VITE_API_BASE_URL=http://localhost:8000
 
 - 프론트엔드를 사용하기 전에 API Gateway가 먼저 실행 중이어야 합니다.
 - 이미지 검색 시 업로드한 이미지는 브라우저에서 base64로 변환된 뒤 백엔드로 전달됩니다.
-- 현재 일부 UI 한글 문구는 인코딩 문제로 깨져 있을 수 있으며, 별도로 정리할 필요가 있습니다.
+- Docker Compose 실행 시에는 Nginx가 `/api` 요청을 `api-gateway:8000`으로 프록시합니다.

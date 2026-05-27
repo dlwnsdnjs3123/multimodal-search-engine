@@ -19,7 +19,6 @@ import json
 import logging
 import os
 import re
-import traceback
 import httpx
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -28,6 +27,12 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from feature_store import RedisFeatureStore
+from persona_registry import (
+    DEFAULT_PERSONA_SCORES,
+    PERSONA_KEYWORD_RULES,
+    PERSONA_KEYS,
+    PERSONA_SESSION_INTERESTS,
+)
 
 # ── 서비스 URL (docker-compose 서비스명 또는 환경변수로 오버라이드) ──
 SEARCH_URL = os.getenv("SEARCH_ENGINE_URL", "http://search-engine:8002")
@@ -1287,10 +1292,7 @@ class OnboardingRequest(BaseModel):
     target_audience: str | None = None
 
 
-VALID_PERSONAS = (
-    "trendsetter", "practical", "value", "brand_loyal", "impulse",
-    "careful", "repeat_stable", "color_focus", "category_focus",
-)
+VALID_PERSONAS = PERSONA_KEYS
 
 
 def _normalize_persona_scores(persona_scores: dict[str, int | float]) -> dict[str, int]:
@@ -1301,7 +1303,7 @@ def _normalize_persona_scores(persona_scores: dict[str, int | float]) -> dict[st
     }
     total = sum(filtered.values())
     if total == 0:
-        return {"practical": 35, "careful": 25, "value": 20, "trendsetter": 20}
+        return dict(DEFAULT_PERSONA_SCORES)
 
     sorted_keys = sorted(filtered, key=filtered.get, reverse=True)
     normalized = {key: round(filtered[key] * 100 / total) for key in sorted_keys}
@@ -1316,18 +1318,7 @@ def _fallback_persona_scores(req: OnboardingRequest) -> dict[str, int]:
     text = " ".join([req.description, " ".join(req.style_choices), req.budget_range or ""]).lower()
     scores = {persona: 0 for persona in VALID_PERSONAS}
 
-    keyword_rules = {
-        "value": ("가성비", "할인", "세일", "저렴", "가격", "budget", "cheap", "sale", "low"),
-        "practical": ("실용", "기본", "출근", "편한", "활용", "minimal", "classic", "daily"),
-        "careful": ("신중", "비교", "리뷰", "고민", "오래", "compare", "review"),
-        "trendsetter": ("트렌드", "유행", "새로운", "힙", "street", "trend", "new"),
-        "impulse": ("충동", "바로", "즉흥", "눈에 띄", "impulse"),
-        "brand_loyal": ("브랜드", "brand", "익숙", "선호 브랜드"),
-        "repeat_stable": ("반복", "재구매", "비슷한", "꾸준", "stable", "repeat"),
-        "color_focus": ("색", "컬러", "검정", "블랙", "화이트", "파랑", "빨강", "color", "black", "white"),
-        "category_focus": ("아우터", "자켓", "재킷", "니트", "셔츠", "원피스", "운동복", "outer", "jacket", "knit", "dress"),
-    }
-    for persona, keywords in keyword_rules.items():
+    for persona, keywords in PERSONA_KEYWORD_RULES.items():
         scores[persona] += sum(18 for keyword in keywords if keyword in text)
 
     if req.budget_range == "low":
@@ -1427,7 +1418,6 @@ async def _call_gemini(prompt: str, json_mode: bool = False, temperature: float 
 
     json_mode=True이면 JSON 외 출력을 차단해 파싱 안정성을 높인다.
     """
-    logging.warning("[GEMINI CALL] %s", "".join(traceback.format_stack()[-4:-1]))
     if not GEMINI_API_KEY:
         return ""
     cooldown_ttl = _gemini_cooldown_ttl()
@@ -1497,29 +1487,6 @@ def _parse_query_interest_payload(payload: object) -> dict[str, int]:
         if score > 0:
             inferred[category] = score
     return inferred
-
-
-async def _infer_session_interest_from_query_llm(query_text: str) -> dict[str, int]:
-    if not _gemini_available() or not query_text.strip():
-        return {}
-
-    category_list = ", ".join(QUERY_INTEREST_CATEGORIES)
-    prompt = (
-        "Infer lightweight fashion recommendation interests from the search query.\n"
-        "Return only JSON. Use only these category keys: "
-        f"{category_list}.\n"
-        "Each score must be an integer from 0 to 3. Use 0 when unrelated. "
-        "Keep scores conservative because this is a short-lived search signal.\n\n"
-        f"Search query: {query_text}\n\n"
-        "JSON format:\n"
-        '{"interest":{"Ladieswear":0,"Menswear":0,"Divided":0,"Sport":0,"Kids":0,"Lingeries/Tights":0}}'
-    )
-
-    try:
-        llm_text = await _call_gemini(prompt, json_mode=True)
-        return _parse_query_interest_payload(json.loads(llm_text))
-    except Exception:
-        return {}
 
 
 async def _infer_session_interest_from_query(query_text: str | None) -> dict[str, int]:
@@ -1846,8 +1813,8 @@ async def _infer_search_intent(query: str | None) -> dict[str, object]:
     if local_intent is not None:
         try:
             feature_store.set_search_intent_cache(normalized_query, local_intent, fallback=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.debug("Failed to cache local search intent: %s", exc)
         return local_intent
 
     cached_intent = feature_store.get_search_intent_cache(normalized_query)
@@ -2660,23 +2627,11 @@ async def onboarding_select(req: PersonaSelectRequest):
     session_interest로 변환해 Redis에 저장한다.
     다음 /api/recommend 호출 시 즉시 반영된다.
     """
-    valid_personas = {"trendsetter", "practical", "value", "brand_loyal", "impulse",
-                      "careful", "repeat_stable", "color_focus", "category_focus"}
-    if req.persona not in valid_personas:
+    if req.persona not in VALID_PERSONAS:
         raise HTTPException(status_code=400, detail=f"알 수 없는 페르소나: {req.persona}")
 
     # 페르소나 → 카테고리 관심도 매핑
-    persona_to_interest: dict[str, dict[str, int]] = {
-        "trendsetter":    {"Ladieswear": 8, "Menswear": 8, "Sport": 6},
-        "practical":      {"Menswear": 9, "Ladieswear": 7},
-        "value":          {"Divided": 9, "Ladieswear": 6, "Menswear": 6},
-        "brand_loyal":    {"Ladieswear": 9, "Menswear": 7, "Lingeries/Tights": 8},
-        "impulse":        {"Ladieswear": 8, "Menswear": 7, "Kids": 5},
-        "careful":        {"Menswear": 7, "Ladieswear": 7, "Sport": 6},
-        "repeat_stable":  {"Ladieswear": 9, "Menswear": 9},
-        "color_focus":    {"Ladieswear": 9, "Divided": 7},
-        "category_focus": {"Ladieswear": 10, "Menswear": 8},
-    }
+    persona_to_interest = PERSONA_SESSION_INTERESTS
 
     # 프론트가 보낸 최신 분석 점수를 우선 사용하고, 없으면 임시 Redis 캐시를 사용한다.
     selected_only_scores = {req.persona: 100}
@@ -2696,7 +2651,7 @@ async def onboarding_select(req: PersonaSelectRequest):
             blended[category] = blended.get(category, 0) + score * (weight / 100.0)
     session_interest = {key: round(value) for key, value in blended.items() if round(value) > 0}
     if not session_interest:
-        session_interest = persona_to_interest[req.persona]
+        session_interest = dict(persona_to_interest[req.persona])
     target_interest = _target_audience_interest(req.target_audience)
     if target_interest:
         session_interest[target_interest] = max(session_interest.get(target_interest, 0), 10)
@@ -2723,9 +2678,9 @@ async def budget_set(
 ):
     """D: 예산 기반 패션 세트 추천.
 
-    rec-models에서 후보 50개를 가져온 뒤, 예산 내 아이템으로 필터링하고
-    search-engine의 /cross-similarity API로 어울리는 조합을 set_count세트 구성한다.
-    search-engine에 /cross-similarity가 미구현 상태라면 score 기반 그리디로 대체한다.
+    rec-models 또는 search-engine 후보를 예산 내 아이템으로 필터링한 뒤,
+    search-engine의 /cross-similarity API에서 받은 CLIP 기반 유사도를 조합 점수에 반영한다.
+    search-engine이 준비되지 않았거나 유사도 계산에 실패하면 score 기반 그리디로 대체한다.
     """
     features = feature_store.get_user_features(user_id)
     raw_persona_scores = features.get("persona_scores", {})
@@ -2868,8 +2823,13 @@ async def budget_set(
             )
             sim_resp.raise_for_status()
             sim_matrix = sim_resp.json().get("similarity", {})
-        except Exception:
-            pass  # 미구현이면 score 기반으로만 진행
+        except httpx.HTTPStatusError as e:
+            logging.info(
+                "cross-similarity unavailable status=%s. Falling back to score-only budget set ranking.",
+                e.response.status_code,
+            )
+        except httpx.RequestError as e:
+            logging.info("cross-similarity request failed: %s. Falling back to score-only budget set ranking.", e)
 
     anchor_ids = {str(item.get("product_id", item.get("article_id", ""))) for item in anchor_candidates}
     complement_ids = {str(item.get("product_id", item.get("article_id", ""))) for item in complement_candidates}

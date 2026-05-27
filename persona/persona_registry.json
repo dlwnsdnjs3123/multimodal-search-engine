@@ -1,0 +1,58 @@
+{
+  "personas": [
+    {
+      "key": "trendsetter",
+      "label_ko": "트렌드 주도형",
+      "summary": "새로운 트렌드에 민감하고 다양한 스타일을 시도하는 고객",
+      "session_interest": {"Ladieswear": 8, "Menswear": 8, "Sport": 6}
+    },
+    {
+      "key": "practical",
+      "label_ko": "실용주의형",
+      "summary": "활용도와 편안함, 기본 아이템을 중시하는 고객",
+      "session_interest": {"Menswear": 9, "Ladieswear": 7}
+    },
+    {
+      "key": "value",
+      "label_ko": "가성비 추구형",
+      "summary": "가격 대비 만족도와 할인 혜택을 중시하는 고객",
+      "session_interest": {"Divided": 9, "Ladieswear": 6, "Menswear": 6}
+    },
+    {
+      "key": "brand_loyal",
+      "label_ko": "브랜드 충성형",
+      "summary": "특정 브랜드, 라인, 스타일 경험에 반복적으로 집중하는 고객",
+      "session_interest": {"Ladieswear": 9, "Menswear": 7, "Lingeries/Tights": 8}
+    },
+    {
+      "key": "impulse",
+      "label_ko": "충동구매형",
+      "summary": "즉각적인 매력과 시각적 반응에 빠르게 구매 결정을 내리는 고객",
+      "session_interest": {"Ladieswear": 8, "Menswear": 7, "Kids": 5}
+    },
+    {
+      "key": "careful",
+      "label_ko": "신중탐색형",
+      "summary": "충분한 비교와 탐색 후 구매를 결정하는 고객",
+      "session_interest": {"Menswear": 7, "Ladieswear": 7, "Sport": 6}
+    },
+    {
+      "key": "repeat_stable",
+      "label_ko": "반복구매형",
+      "summary": "검증된 선택과 유사 상품을 안정적으로 반복 구매하는 고객",
+      "session_interest": {"Ladieswear": 9, "Menswear": 9}
+    },
+    {
+      "key": "color_focus",
+      "label_ko": "색상집중형",
+      "summary": "특정 색상과 톤을 중심으로 상품을 탐색하는 고객",
+      "session_interest": {"Ladieswear": 9, "Divided": 7}
+    },
+    {
+      "key": "category_focus",
+      "label_ko": "카테고리집중형",
+      "summary": "특정 상품 카테고리 안에서 깊게 비교하고 선택하는 고객",
+      "session_interest": {"Ladieswear": 10, "Menswear": 8}
+    }
+  ]
+}
