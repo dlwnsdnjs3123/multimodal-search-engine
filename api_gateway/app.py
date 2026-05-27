@@ -189,6 +189,7 @@ def _load_article_meta() -> dict[str, dict]:
                     "main_category": row.get("main_category", ""),
                     "color": row.get("color", ""),
                     "product_type": row.get("product_type_name", ""),
+                    "product_group": row.get("product_group_name", ""),
                     "price": 0,
                     "price_source": "",
                 }
@@ -210,11 +211,46 @@ def _load_article_meta() -> dict[str, dict]:
     return meta
 
 
+_outfit_slot_index: dict[str, list[str]] = {}  # slot -> [article_id, ...]
+
+
+def _outfit_slot(meta: dict) -> str:
+    """아이템의 outfit slot을 반환한다 (top/bottom/outer/dress/accessory/shoes/other)."""
+    group = str(meta.get("product_group", "")).lower()
+    ptype = str(meta.get("product_type", "")).lower()
+    if "lower body" in group:
+        return "bottom"
+    if "full body" in group:
+        return "dress"
+    if "upper body" in group:
+        if any(k in ptype for k in ("coat", "jacket", "blazer", "cardigan", "waistcoat")):
+            return "outer"
+        return "top"
+    if "shoe" in group:
+        return "shoes"
+    if group in ("accessories", "bags", "socks & tights"):
+        return "accessory"
+    if "underwear" in group or "nightwear" in group:
+        return "underwear"
+    return "other"
+
+
+def _build_slot_index(meta: dict[str, dict]) -> dict[str, list[str]]:
+    index: dict[str, list[str]] = {}
+    for aid, item_meta in meta.items():
+        slot = _outfit_slot(item_meta)
+        if slot == "other":
+            continue
+        index.setdefault(slot, []).append(aid)
+    return index
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global feature_store, article_meta
+    global feature_store, article_meta, _outfit_slot_index
     feature_store = RedisFeatureStore(host=REDIS_HOST, port=REDIS_PORT)
     article_meta = _load_article_meta()
+    _outfit_slot_index = _build_slot_index(article_meta)
     yield
 
 
@@ -2845,8 +2881,24 @@ async def budget_set(
         anchor_ids=anchor_ids,
         complement_ids=complement_ids,
         query_constraints=query_constraints,
+        target_audience=target_audience,
     )
     return {"sets": sets, "budget": budget, "set_count": len(sets)}
+
+
+_OUTFIT_TEMPLATES = [
+    ["top", "bottom", "outer", "accessory", "shoes"],
+    ["top", "bottom", "outer", "shoes"],
+    ["top", "bottom", "outer", "accessory"],
+    ["top", "bottom", "accessory", "shoes"],
+    ["top", "bottom", "accessory"],
+    ["top", "bottom", "shoes"],
+    ["top", "bottom"],
+    ["dress", "outer", "accessory", "shoes"],
+    ["dress", "outer", "accessory"],
+    ["dress", "accessory", "shoes"],
+    ["dress", "accessory"],
+]
 
 
 def _build_outfit_sets(
@@ -2858,70 +2910,89 @@ def _build_outfit_sets(
     anchor_ids: set[str] | None = None,
     complement_ids: set[str] | None = None,
     query_constraints: dict[str, set[str]] | None = None,
+    target_audience: str | None = None,
 ) -> list[list[dict]]:
-    """예산 내에서 anchor + complement 형태의 n세트 조합.
+    """Slot 기반 outfit 세트 조합.
 
-    sim_matrix가 있으면 아이템 간 유사도 합산 점수를 가중치로 활용한다.
+    후보 풀을 outfit slot(top/bottom/outer/dress/accessory/shoes)으로 분류한 뒤
+    템플릿에 따라 예산 내 세트를 구성한다. 후보 풀에 없는 슬롯은 전체 카탈로그에서 보충한다.
     """
-    sorted_candidates = sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)
-    anchor_ids = anchor_ids or {str(item.get("article_id", "")) for item in sorted_candidates}
-    complement_ids = complement_ids or {str(item.get("article_id", "")) for item in sorted_candidates}
-    query_constraints = query_constraints or {"colors": set(), "products": set()}
-    anchors = [item for item in sorted_candidates if str(item.get("article_id", "")) in anchor_ids]
-    complements = [item for item in sorted_candidates if str(item.get("article_id", "")) in complement_ids]
-    if not complements:
-        complements = sorted_candidates
+    DEFAULT_PRICE = 25000
+    allowed_main_cats = TARGET_AUDIENCE_TO_MAIN_CATEGORY.get(target_audience or "all", set())
+
+    def to_catalog_item(aid: str, score: float = 0.0) -> dict:
+        meta = article_meta.get(aid, {})
+        price = int(meta.get("price") or 0) or DEFAULT_PRICE
+        return {
+            "product_id": aid,
+            "article_id": aid,
+            "name": meta.get("name", ""),
+            "score": score,
+            "price_int": price,
+            "category": meta.get("category", ""),
+            "main_category": meta.get("main_category", ""),
+            "color": meta.get("color", ""),
+            "product_type": meta.get("product_type", ""),
+            "product_group": meta.get("product_group", ""),
+            "brand": meta.get("brand", ""),
+            "image_url": image_url_for_article(aid),
+            "price_estimated": not bool(meta.get("price")),
+        }
+
+    # 후보를 slot별로 분류
+    slot_pools: dict[str, list[dict]] = {}
+    for item in sorted(candidates, key=lambda x: float(x.get("score") or 0), reverse=True):
+        aid = str(item.get("article_id") or item.get("product_id", ""))
+        if not aid:
+            continue
+        meta = article_meta.get(aid, {})
+        slot = _outfit_slot(meta)
+        slot_pools.setdefault(slot, []).append({**item, "article_id": aid})
+
+    # 부족한 슬롯은 전체 카탈로그에서 보충 (target_audience 필터 적용)
+    needed_slots = {"top", "bottom", "outer", "dress", "accessory", "shoes"}
+    for slot in needed_slots:
+        if len(slot_pools.get(slot, [])) < 3 and slot in _outfit_slot_index:
+            existing_ids = {item["article_id"] for item in slot_pools.get(slot, [])}
+            for aid in _outfit_slot_index[slot]:
+                if len(slot_pools.get(slot, [])) >= 15:
+                    break
+                if aid in existing_ids:
+                    continue
+                if allowed_main_cats:
+                    item_main_cat = article_meta.get(aid, {}).get("main_category", "")
+                    if item_main_cat not in allowed_main_cats:
+                        continue
+                slot_pools.setdefault(slot, []).append(to_catalog_item(aid))
 
     sets: list[list[dict]] = []
     used_ids: set[str] = set()
 
-    for anchor in anchors:
+    for template in _OUTFIT_TEMPLATES:
         if len(sets) >= count:
             break
-
-        anchor_id = anchor["article_id"]
-        if anchor_id in used_ids or anchor["price_int"] > budget:
+        # 이 템플릿에 필요한 슬롯 후보가 있는지 확인
+        if not all(slot_pools.get(slot) for slot in template):
             continue
 
-        current_set: list[dict] = [anchor]
-        current_cost = anchor["price_int"]
-        used_ids.add(anchor_id)
-        used_categories = {str(anchor.get("category", "")).lower()}
-
-        for item in complements:
-            aid = item["article_id"]
-            if aid in used_ids:
-                continue
-            if current_cost + item["price_int"] > budget:
-                continue
-            item_category = str(item.get("category", "")).lower()
-            item_product = str(item.get("product_type", "")).lower()
-            if len(current_set) < 3 and item_category in used_categories and item_product in used_categories:
-                continue
-            if _item_matches_query_constraints(item, query_constraints) and len(current_set) > 1:
-                continue
-
-            # sim_matrix가 있으면 현재 세트와의 평균 유사도로 어울림 판단
-            if sim_matrix and current_set:
-                sim_scores = [
-                    sim_matrix.get(existing["article_id"], {}).get(aid, 0)
-                    for existing in current_set
-                ]
-                avg_sim = sum(sim_scores) / len(sim_scores)
-                if avg_sim < 0.2:
+        outfit: list[dict] = []
+        cost = 0
+        for slot in template:
+            for item in slot_pools.get(slot, []):
+                aid = item["article_id"]
+                if aid in used_ids:
                     continue
+                price = item.get("price_int", DEFAULT_PRICE)
+                if cost + price > budget:
+                    continue
+                outfit.append(item)
+                cost += price
+                break  # 슬롯당 1개
 
-            current_set.append(item)
-            current_cost += item["price_int"]
-            used_ids.add(aid)
-            used_categories.add(item_category)
-            used_categories.add(item_product)
-
-            if len(current_set) >= 3:
-                break
-
-        if current_set:
-            sets.append(current_set)
+        if len(outfit) >= 2:
+            sets.append(outfit)
+            for item in outfit:
+                used_ids.add(item["article_id"])
 
     return sets
 
